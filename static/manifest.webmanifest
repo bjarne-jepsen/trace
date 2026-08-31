@@ -1,0 +1,23 @@
+{
+  "name": "Trace — Personal timeline",
+  "short_name": "Trace",
+  "description": "Capture wellbeing, reminders, habits, places, and everyday moments in one personal timeline.",
+  "id": "/",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": ["standalone"],
+  "orientation": "portrait-primary",
+  "background_color": "#f5f3ec",
+  "theme_color": "#f5f3ec",
+  "categories": ["lifestyle", "productivity", "health"],
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Speak a capture", "short_name": "Speak", "description": "Open Trace ready for voice capture", "url": "/?capture=voice" },
+    { "name": "Type a capture", "short_name": "Type", "description": "Open Trace with the keyboard ready", "url": "/?capture=type" },
+    { "name": "Wellbeing check-in", "short_name": "Wellbeing", "description": "Quickly capture how you feel", "url": "/?checkin=wellbeing" }
+  ]
+}
