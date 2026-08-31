@@ -82,6 +82,17 @@ select {
 	font-size: 10px;
 }
 
+.trace-header .avatar.data-button {
+	width: auto;
+	min-width: 48px;
+	padding: 0 10px;
+	border-radius: 10px;
+	font-family: 'JetBrains Mono', ui-monospace, monospace;
+	font-size: 8px;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
 .trace-tabs {
 	position: sticky;
 	top: 0;
@@ -138,6 +149,37 @@ select {
 .timeline-section:empty {
 	display: none;
 }
+
+.backup-nudge {
+	display: grid;
+	width: calc(100% - 44px);
+	min-height: 66px;
+	margin: 0 22px 18px;
+	padding: 11px 13px;
+	grid-template-columns: 34px minmax(0, 1fr) 18px;
+	align-items: center;
+	gap: 10px;
+	border: 1px solid rgba(183, 154, 62, 0.28);
+	border-radius: 15px;
+	background: #f1ead5;
+	color: var(--ink);
+	text-align: left;
+}
+
+.backup-nudge > span {
+	display: grid;
+	width: 32px;
+	height: 32px;
+	place-items: center;
+	border-radius: 10px;
+	background: #fffaf0;
+	color: #826b27;
+	font-weight: 800;
+}
+
+.backup-nudge b { display: block; font-size: 11px; }
+.backup-nudge small { display: block; margin-top: 3px; color: #6d654d; font-size: 9px; line-height: 1.35; }
+.backup-nudge i { color: #826b27; font-size: 13px; font-style: normal; }
 
 .trace-spine {
 	display: grid;
@@ -240,13 +282,14 @@ select {
 }
 
 .spine-trace-open strong {
-	display: block;
+	display: -webkit-box;
 	overflow: hidden;
-	font-size: 16px;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	font-size: 14px;
 	font-weight: 600;
-	letter-spacing: -0.025em;
-	text-overflow: ellipsis;
-	white-space: nowrap;
+	line-height: 1.3;
+	letter-spacing: -0.015em;
 }
 
 .spine-trace-open > span {
@@ -486,6 +529,54 @@ select {
 	background: #fff;
 	box-shadow: 0 2px 7px rgba(20, 21, 16, 0.08);
 	color: var(--ink);
+}
+
+.capture-language {
+	display: flex;
+	margin: 7px 2px 5px;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+	color: var(--muted-strong);
+	font-family: 'JetBrains Mono', ui-monospace, monospace;
+	font-size: 8px;
+	letter-spacing: 0.05em;
+	text-transform: uppercase;
+}
+
+.capture-language > div {
+	display: flex;
+	padding: 2px;
+	gap: 2px;
+	border-radius: 8px;
+	background: #eae7de;
+}
+
+.capture-language button {
+	min-height: 26px;
+	padding: 5px 8px;
+	border: 0;
+	border-radius: 6px;
+	background: transparent;
+	color: #62645a;
+	font-size: 8px;
+	font-weight: 700;
+}
+
+.capture-language button.active {
+	background: var(--paper);
+	box-shadow: 0 1px 4px rgba(20, 21, 16, 0.09);
+	color: var(--ink);
+}
+
+.capture-language button:disabled { opacity: 0.5; }
+
+.timeline-copy > strong {
+	display: -webkit-box;
+	overflow: hidden;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-height: 1.35;
 }
 
 .capture-sheet .capture-card {

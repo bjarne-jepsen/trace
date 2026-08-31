@@ -94,3 +94,28 @@ describe('Danish entry interpretation', () => {
 		expect(entry.detail).toBe('45 minutes');
 	});
 });
+
+describe('honest interpretation details', () => {
+	test('does not invent a wellbeing score when none was provided', () => {
+		const entry = interpretEntry('I slept badly last night');
+		expect(entry.category).toBe('Wellbeing');
+		expect(entry.detail).toBe('Wellbeing noted');
+		expect(entry.detail).not.toMatch(/\/ 10/);
+	});
+
+	test('keeps a wellbeing score when the user explicitly provides one', () => {
+		const entry = interpretEntry('My tinnitus is 7 out of 10 today');
+		expect(entry.detail).toBe('7 / 10');
+	});
+
+	test('keeps an explicitly provided Danish wellbeing score', () => {
+		const entry = interpretEntry('Min tinnitus er 6,5 ud af 10 i dag');
+		expect(entry.detail).toBe('6.5 / 10');
+	});
+
+	test('does not claim that a local reminder will notify the user', () => {
+		const entry = interpretEntry('Remind me to call Michael tomorrow');
+		expect(entry.detail).toBe('Reminder saved in Trace');
+		expect(entry.syncStatus).toBe('Local');
+	});
+});

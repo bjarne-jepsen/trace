@@ -317,13 +317,10 @@ function describesPastActivity(text: string) {
 	return /\b(yesterday|i går|last\s+\w+|sidste\s+\w+|went|had|was|were|did|finished|completed|trained|ran|cycled|swam|walked|hiked|meditated|worked out|exercised|gik|havde|var|gjorde|afsluttede|trænede|løb|cyklede|svømmede|vandrede|mediterede|motionerede)\b/i.test(text);
 }
 
-function derivedScore(text: string) {
-	const explicit = text.match(/(\d+(?:\.\d+)?)\s*(?:\/\s*10|out of 10)/i);
-	if (explicit) return `${explicit[1]} / 10`;
-	if (/terrible|severe|very bad|awful|forfærdelig|meget slemt|voldsom/i.test(text)) return '8 / 10 · Intense';
-	if (/mild|little|barely|good|svag|lidt|næsten ikke|godt/i.test(text)) return '3 / 10 · Mild';
-	if (/quite|noticeable|annoying|worse|tydelig|mærkbar|irriterende|værre/i.test(text)) return '6 / 10 · Noticeable';
-	return '5 / 10 · Moderate';
+function wellbeingDetail(text: string) {
+	const explicit = text.match(/(\d+(?:[.,]\d+)?)\s*(?:\/\s*10|out of 10|ud af 10)/i);
+	if (explicit) return `${explicit[1].replace(',', '.')} / 10`;
+	return /tinnitus/i.test(text) ? 'Tinnitus noted' : 'Wellbeing noted';
 }
 
 function extractDate(text: string) {
@@ -401,7 +398,7 @@ function routeEntry(text: string, category: EntryCategory): Routing {
 			scheduledTime,
 			reminderMinutes: 0,
 			externalProvider: scheduledTime ? 'Google Calendar' : 'Google Tasks',
-			syncStatus: 'Ready'
+			syncStatus: 'Local'
 		};
 	}
 
@@ -416,7 +413,7 @@ function routeEntry(text: string, category: EntryCategory): Routing {
 			durationMinutes: 60,
 			reminderMinutes: 30,
 			externalProvider: 'Google Calendar',
-			syncStatus: 'Ready'
+			syncStatus: 'Local'
 		};
 	}
 
@@ -431,7 +428,7 @@ function routeEntry(text: string, category: EntryCategory): Routing {
 			durationMinutes: 120,
 			reminderMinutes: 30,
 			externalProvider: 'Google Calendar',
-			syncStatus: 'Ready'
+			syncStatus: 'Local'
 		};
 	}
 
@@ -446,7 +443,7 @@ function routeEntry(text: string, category: EntryCategory): Routing {
 			durationMinutes: durationMinutesFrom(text) || 60,
 			reminderMinutes: 30,
 			externalProvider: 'Google Calendar',
-			syncStatus: 'Ready'
+			syncStatus: 'Local'
 		};
 	}
 
@@ -567,7 +564,7 @@ export function interpretEntry(transcript: string): EntryDraft {
 		return {
 			category: 'Wellbeing',
 			title: /tinnitus/i.test(text) ? 'Tinnitus' : 'Wellbeing check-in',
-			detail: derivedScore(text),
+			detail: wellbeingDetail(text),
 			when: 'Today',
 			transcript: text,
 			...routingMeta,
@@ -607,7 +604,7 @@ export function interpretEntry(transcript: string): EntryDraft {
 		return {
 			category: 'Reminder',
 			title: action ? action[0].toUpperCase() + action.slice(1) : 'New reminder',
-			detail: 'Notification on',
+			detail: 'Reminder saved in Trace',
 			when,
 			transcript: text,
 			...routingMeta,

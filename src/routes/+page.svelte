@@ -10,6 +10,7 @@
 	import { deleteLocalEntry, listLocalEntries, saveLocalEntries, saveLocalEntry } from '$lib/local-entries';
 
 	type CaptureState = 'idle' | 'requesting' | 'listening' | 'processing';
+	type CaptureLanguage = 'da-DK' | 'en-US';
 	type ActiveTab = 'today' | 'timeline' | 'upcoming' | 'insights';
 	type InsightRange = 7 | 30 | 'all';
 	type TimelineFilter = EntryCategory | 'All';
@@ -53,6 +54,12 @@
 	const bars = [12, 20, 31, 17, 39, 24, 45, 28, 36, 18, 29, 14];
 	const insightCategories: EntryCategory[] = ['Wellbeing', 'Habit', 'Reminder', 'Place', 'Social', 'Note'];
 	const destinations: EntryDestination[] = ['Timeline', 'Calendar', 'Reminder'];
+	const legacyInferredWellbeingDetails = new Set([
+		'3 / 10 · Mild',
+		'5 / 10 · Moderate',
+		'6 / 10 · Noticeable',
+		'8 / 10 · Intense'
+	]);
 	const repeatCaptures = [
 		{ label: 'Tinnitus', symbol: '◎', prompt: 'My tinnitus feels ' },
 		{ label: 'Training', symbol: '↗', prompt: 'I trained for ' },
@@ -66,6 +73,7 @@
 	let captureMessage = $state('');
 	let manualText = $state('');
 	let showManual = $state(false);
+	let captureLanguage = $state<CaptureLanguage>('da-DK');
 	let manualInput = $state<HTMLTextAreaElement | null>(null);
 	let draft = $state<EntryDraft | null>(null);
 	let editing = $state(false);
@@ -92,6 +100,7 @@
 	let insightRange = $state<InsightRange>(7);
 	let timelineQuery = $state('');
 	let timelineFilter = $state<TimelineFilter>('All');
+	let showAllAhead = $state(false);
 
 	let recognition: RecognitionLike | null = null;
 	let stream: MediaStream | null = null;
@@ -108,7 +117,7 @@
 	const statusCopy = $derived(
 		captureState === 'requesting' ? 'Opening microphone…' :
 		captureState === 'listening' ? 'Listening… tap when done' :
-		captureState === 'processing' ? 'Making sense of that…' :
+		captureState === 'processing' ? 'Finishing capture…' :
 		'Tap once, then speak naturally'
 	);
 	const todayKey = localDateAfter(0);
@@ -241,6 +250,12 @@
 				return leftValue.localeCompare(rightValue);
 			})
 	);
+	const backupDue = $derived.by(() => {
+		if (timeline.length < 25) return false;
+		if (!lastBackupAt) return true;
+		const lastBackup = Date.parse(lastBackupAt);
+		return !Number.isFinite(lastBackup) || Date.now() - lastBackup >= 14 * 24 * 60 * 60 * 1000;
+	});
 	const upcomingGroups = $derived.by(() => {
 		const today = new Date();
 		today.setHours(0, 0, 0, 0);
@@ -294,9 +309,30 @@
 		return null;
 	});
 
+	function sanitizeLegacyEntry(entry: TimelineEntry) {
+		let detail = entry.detail;
+		if (entry.category === 'Wellbeing' && legacyInferredWellbeingDetails.has(detail)) {
+			detail = /tinnitus/i.test(entry.transcript) ? 'Tinnitus noted' : 'Wellbeing noted';
+		}
+		if (entry.destination === 'Reminder' && detail === 'Notification on') detail = 'Reminder saved in Trace';
+		if (detail === entry.detail && entry.syncStatus !== 'Ready') return entry;
+		return { ...entry, detail, syncStatus: 'Local' as const };
+	}
+
+	async function loadStoredEntries() {
+		const entries = await listLocalEntries();
+		const sanitized = entries.map(sanitizeLegacyEntry);
+		if (sanitized.some((entry, index) => entry !== entries[index])) await saveLocalEntries(sanitized);
+		timeline = sanitized;
+	}
+
 	onMount(() => {
 		lastBackupAt = window.localStorage.getItem('trace-last-backup-at') || '';
 		showManual = window.localStorage.getItem('trace-capture-method') === 'type';
+		const storedLanguage = window.localStorage.getItem('trace-capture-language');
+		captureLanguage = storedLanguage === 'en-US' || storedLanguage === 'da-DK'
+			? storedLanguage
+			: navigator.language.toLocaleLowerCase().startsWith('da') ? 'da-DK' : 'en-US';
 		const launch = new URL(window.location.href);
 		const captureMode = launch.searchParams.get('capture');
 		const checkin = launch.searchParams.get('checkin');
@@ -315,8 +351,7 @@
 		window.requestAnimationFrame(() => {
 			if (showManual) manualInput?.focus();
 		});
-		void listLocalEntries()
-			.then((entries) => (timeline = entries))
+		void loadStoredEntries()
 			.catch(() => (notice = 'Saved entries could not be opened on this device'))
 			.finally(() => (loadingEntries = false));
 		return () => {
@@ -360,15 +395,13 @@
 		liveTranscript = cleaned;
 		draftSaveError = '';
 		captureState = 'processing';
-		window.setTimeout(() => {
-			draft = interpretEntry(cleaned);
-			showDraftDetails = false;
-			draftTimeConfirmed = Boolean(draft.scheduledTime);
-			placeLocationState = 'idle';
-			placeLocationMessage = '';
-			captureState = 'idle';
-			liveTranscript = '';
-		}, 620);
+		draft = interpretEntry(cleaned);
+		showDraftDetails = false;
+		draftTimeConfirmed = Boolean(draft.scheduledTime);
+		placeLocationState = 'idle';
+		placeLocationMessage = '';
+		captureState = 'idle';
+		liveTranscript = '';
 	}
 
 	function completeCapture(value?: string) {
@@ -433,7 +466,7 @@
 				return;
 			}
 			recognition = new Recognition();
-			recognition.lang = navigator.language || 'en-US';
+			recognition.lang = captureLanguage;
 			recognition.continuous = true;
 			recognition.interimResults = true;
 			recognition.onresult = (event) => {
@@ -515,6 +548,12 @@
 		if (showManual) window.requestAnimationFrame(() => manualInput?.focus());
 	}
 
+	function setCaptureLanguage(language: CaptureLanguage) {
+		if (captureState !== 'idle') return;
+		captureLanguage = language;
+		window.localStorage.setItem('trace-capture-language', language);
+	}
+
 	function startRepeatCapture(prompt: string) {
 		if (captureState !== 'idle') return;
 		captureOpen = true;
@@ -534,15 +573,13 @@
 		showManual = keepTypedCapture;
 		liveTranscript = value;
 		captureState = 'processing';
-		window.setTimeout(() => {
-			draft = interpretEntry(value);
-			showDraftDetails = false;
-			draftTimeConfirmed = Boolean(draft.scheduledTime);
-			placeLocationState = 'idle';
-			placeLocationMessage = '';
-			liveTranscript = '';
-			captureState = 'idle';
-		}, 520);
+		draft = interpretEntry(value);
+		showDraftDetails = false;
+		draftTimeConfirmed = Boolean(draft.scheduledTime);
+		placeLocationState = 'idle';
+		placeLocationMessage = '';
+		liveTranscript = '';
+		captureState = 'idle';
 	}
 
 	function submitManual(event: Event) {
@@ -566,7 +603,7 @@
 		draft.destinationReason = 'Action changed during confirmation';
 		draft.calendar = destination === 'Calendar';
 		draft.reminder = destination === 'Reminder';
-		draft.syncStatus = destination === 'Timeline' ? 'Local' : 'Ready';
+		draft.syncStatus = 'Local';
 		if (destination === 'Calendar') {
 			draft.externalProvider = 'Google Calendar';
 			draft.durationMinutes ??= 60;
@@ -832,6 +869,12 @@
 		return `Last backup ${formatDateTime24(date)}`;
 	}
 
+	function openDataTools() {
+		showDataTools = true;
+		backupMessage = '';
+		backupError = '';
+	}
+
 	function formatClockTime(value?: string) {
 		if (!value) return '';
 		const cleaned = value.trim().replace(/\./g, '');
@@ -903,8 +946,8 @@
 	async function confirmDraft() {
 		if (!draft || savingDraft) return;
 		draftSaveError = '';
-		if (!draft.title.trim() || !draft.detail.trim() || !draft.when.trim()) {
-			draftSaveError = 'Title, details, and when are required.';
+		if (!draft.title.trim() || !draft.detail.trim()) {
+			draftSaveError = 'Add a title and details before saving.';
 			return;
 		}
 		if (draft.destination !== 'Timeline' && !draft.scheduledDate) {
@@ -915,7 +958,7 @@
 		draft.calendar = draft.destination === 'Calendar';
 		draft.reminder = draft.destination === 'Reminder';
 		draft.eventTime = draft.scheduledTime;
-		draft.syncStatus = draft.destination === 'Timeline' ? 'Local' : 'Ready';
+		draft.syncStatus = 'Local';
 		draft.externalProvider = draft.destination === 'Calendar'
 			? 'Google Calendar'
 			: draft.destination === 'Reminder'
@@ -952,7 +995,7 @@
 			showToast(
 				entries.length > 1
 					? `${entries.length} upcoming traces saved`
-					: entries[0].destination === 'Timeline' ? `${entries[0].category} saved` : `${entries[0].destination} route saved`,
+					: entries[0].destination === 'Timeline' ? `${entries[0].category} saved` : 'Plan saved in Trace',
 				'capture',
 				5200
 			);
@@ -1045,7 +1088,7 @@
 			...editingEntry,
 			title: editingEntry.title.trim(),
 			detail: editingEntry.detail.trim(),
-			when: editingEntry.when.trim(),
+			when: editingEntry.when.trim() || (editingEntry.scheduledDate ? formatScheduledDate(editingEntry.scheduledDate) : 'Captured'),
 			people: editingEntry.category === 'Social'
 				? editingPeople.split(/,|\band\b/i).map((person) => person.trim()).filter(Boolean)
 				: undefined,
@@ -1059,7 +1102,7 @@
 				: editingEntry.destination === 'Reminder'
 					? (editingEntry.scheduledTime ? 'Google Calendar' : 'Google Tasks')
 					: undefined,
-			syncStatus: editingEntry.destination === 'Timeline' ? 'Local' : 'Ready'
+			syncStatus: 'Local'
 		};
 		if (updated.category === 'Place') {
 			updated.placeAddress = updated.placeAddress?.trim() || undefined;
@@ -1074,7 +1117,7 @@
 			updated.mapsSearchUrl = undefined;
 			updated.mapsPinUrl = undefined;
 		}
-		if (!updated.title || !updated.detail || !updated.when || (updated.destination !== 'Timeline' && !updated.scheduledDate)) return;
+		if (!updated.title || !updated.detail || (updated.destination !== 'Timeline' && !updated.scheduledDate)) return;
 		try {
 			await saveLocalEntry(updated);
 			timeline = timeline.map((entry) => (entry.id === updated.id ? updated : entry));
@@ -1091,7 +1134,7 @@
 		const updated: TimelineEntry = {
 			...entry,
 			status: 'Completed',
-			syncStatus: 'Ready'
+			syncStatus: 'Local'
 		};
 		try {
 			await saveLocalEntry(updated);
@@ -1125,9 +1168,9 @@
 
 {#snippet traceCard(entry: TimelineEntry)}
 	<article class="timeline-item">
-		<button class="timeline-entry-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.title}`}>
+		<button class="timeline-entry-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.transcript}`}>
 			<span class={`category-dot ${entry.category.toLowerCase()}`}></span>
-			<span class="timeline-copy"><span class="timeline-meta"><span>{entry.category}</span><span class={`route-badge ${entry.destination.toLowerCase()}`}>{entry.destination}</span><time>{formatClockTime(entry.time)}</time></span><strong>{entry.title}</strong><span class="timeline-description">{displayEntryDetail(entry)} · {displayEntryTiming(entry)}</span></span>
+			<span class="timeline-copy"><span class="timeline-meta"><span>{entry.category}</span><span class={`route-badge ${entry.destination.toLowerCase()}`}>{entry.destination}</span><time>{formatClockTime(entry.time)}</time></span><strong>{entry.transcript}</strong><span class="timeline-description">{displayEntryTiming(entry)} · {displayEntryDetail(entry)}</span></span>
 			<span class="timeline-chevron" aria-hidden="true">›</span>
 		</button>
 		<details class="entry-menu"><summary aria-label={`More actions for ${entry.title}`}>•••</summary><div><button type="button" onclick={() => beginEntryEdit(entry)}>Edit</button><button class="danger" type="button" onclick={() => deleteEntryWithUndo(entry)}>Delete</button></div></details>
@@ -1142,9 +1185,9 @@
 		</div>
 		<div class="spine-trace-body">
 			<span class={`spine-dot ${entry.category.toLowerCase()}`} aria-hidden="true"></span>
-			<button class="spine-trace-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.title}`}>
-				<strong>{entry.title}</strong>
-				<span>{displayEntryDetail(entry)} · {displayEntryTiming(entry)}</span>
+			<button class="spine-trace-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.transcript}`}>
+				<strong>{entry.transcript}</strong>
+				<span>{displayEntryTiming(entry)} · {displayEntryDetail(entry)}</span>
 				<small><i class={`category-dot ${entry.category.toLowerCase()}`}></i>{entry.category.toUpperCase()}{entry.destination !== 'Timeline' ? ` · ${entry.destination.toUpperCase()}` : ''}</small>
 			</button>
 			<details class="entry-menu spine-menu"><summary aria-label={`More actions for ${entry.title}`}>•••</summary><div><button type="button" onclick={() => beginEntryEdit(entry)}>Edit</button>{#if entry.destination === 'Reminder' && entry.status !== 'Completed'}<button type="button" onclick={() => completeReminder(entry)}>Mark done</button>{/if}<button class="danger" type="button" onclick={() => deleteEntryWithUndo(entry)}>Delete</button></div></details>
@@ -1165,12 +1208,12 @@
 	<section class="phone-stage" aria-label="Trace personal timeline">
 		<header class="trace-header">
 			<div><p>{day} · On this device</p><h1>What’s happening?</h1></div>
-			<button class="avatar" type="button" onclick={() => { showDataTools = true; backupMessage = ''; backupError = ''; }} aria-label="Open Trace data tools">BJ</button>
+			<button class="avatar data-button" type="button" onclick={openDataTools} aria-label="Open Trace data and backup tools">Data</button>
 		</header>
 
 		<nav class="trace-tabs" aria-label="Trace sections">
-			<button class:active={activeTab === 'today' || activeTab === 'timeline'} type="button" onclick={showToday}>Today</button>
-			<button class:active={activeTab === 'upcoming'} type="button" onclick={showUpcoming}>Upcoming{#if actionableEntries.length}<span>{actionableEntries.length}</span>{/if}</button>
+			<button class:active={activeTab === 'today'} type="button" onclick={showToday}>Today</button>
+			<button class:active={activeTab === 'upcoming'} type="button" onclick={showUpcoming}>Plans{#if actionableEntries.length}<span>{actionableEntries.length}</span>{/if}</button>
 			<button class:active={activeTab === 'insights'} type="button" onclick={showInsights}>Insights</button>
 		</nav>
 
@@ -1181,6 +1224,10 @@
 		<div class="capture-methods" aria-label="Choose a capture method">
 			<button type="button" class:active={!showManual} onclick={() => setCaptureMethod('voice')} disabled={captureState !== 'idle'} aria-pressed={!showManual}><span class="voice-method-icon" aria-hidden="true"><i></i></span>Speak</button>
 			<button type="button" class:active={showManual} onclick={() => setCaptureMethod('type')} disabled={captureState !== 'idle'} aria-pressed={showManual}><span aria-hidden="true">⌨</span>Type or dictate</button>
+		</div>
+		<div class="capture-language" aria-label="Voice recognition language">
+			<span>Voice language</span>
+			<div><button type="button" class:active={captureLanguage === 'da-DK'} onclick={() => setCaptureLanguage('da-DK')} disabled={captureState !== 'idle'} aria-pressed={captureLanguage === 'da-DK'}>Dansk</button><button type="button" class:active={captureLanguage === 'en-US'} onclick={() => setCaptureLanguage('en-US')} disabled={captureState !== 'idle'} aria-pressed={captureLanguage === 'en-US'}>English</button></div>
 		</div>
 
 		<section class:listening={captureState === 'listening'} class:typing={showManual} class="capture-card" aria-live="polite">
@@ -1227,6 +1274,7 @@
 		{/if}
 
 		<section class="timeline-section">
+			{#if activeTab === 'today' && backupDue}<button class="backup-nudge" type="button" onclick={openDataTools}><span>↓</span><div><b>Protect your traces</b><small>Your history currently lives only on this device. Create a fresh backup.</small></div><i>→</i></button>{/if}
 			{#if activeTab === 'today'}
 				{#if loadingEntries}
 					<div class="timeline-empty spine-loading"><span class="spinner dark"></span><p>Opening your traces…</p></div>
@@ -1245,14 +1293,14 @@
 						{/if}
 
 						<section class="spine-section ahead-spine">
-							<header><span>Ahead</span>{#if aheadEntries.length}<button type="button" onclick={showUpcoming}>View all {aheadEntries.length} →</button>{/if}</header>
-							{#if aheadEntries.length}{#each aheadEntries.slice(0, 4) as entry (entry.id)}{@render spineTrace(entry, 'ahead')}{/each}{#if aheadEntries.length > 4}<button class="spine-more" type="button" onclick={showUpcoming}>See {aheadEntries.length - 4} more upcoming {aheadEntries.length - 4 === 1 ? 'trace' : 'traces'} →</button>{/if}{:else}<button class="spine-empty" type="button" onclick={() => openCapture('type')}><span>→</span><div><b>Nothing planned ahead</b><small>Future events and reminders will appear here.</small></div></button>{/if}
+							<header><span>Ahead</span>{#if actionableEntries.length}<button type="button" onclick={showUpcoming}>View plans {actionableEntries.length} →</button>{/if}</header>
+							{#if aheadEntries.length}{#each aheadEntries.slice(0, showAllAhead ? aheadEntries.length : 4) as entry (entry.id)}{@render spineTrace(entry, 'ahead')}{/each}{#if aheadEntries.length > 4 && !showAllAhead}<button class="spine-more" type="button" onclick={() => (showAllAhead = true)}>Show {aheadEntries.length - 4} more future {aheadEntries.length - 4 === 1 ? 'trace' : 'traces'} →</button>{/if}{:else}<button class="spine-empty" type="button" onclick={() => openCapture('type')}><span>→</span><div><b>Nothing planned ahead</b><small>Future events and reminders will appear here.</small></div></button>{/if}
 						</section>
 
 						{#if pastEntries.length}
 							<details class="behind-section">
-								<summary><span>Behind</span><small>{pastEntries.length} {pastEntries.length === 1 ? 'trace' : 'traces'} · back to {formatSpineDate(pastEntries[pastEntries.length - 1])}</small><i aria-hidden="true">＋</i></summary>
-								<div class="behind-content">{#each pastEntries as entry (entry.id)}{@render spineTrace(entry, 'past')}{/each}<button class="open-archive" type="button" onclick={showTimeline}>Search the full timeline <span>→</span></button></div>
+								<summary><span>Past traces</span><small>{pastEntries.length} {pastEntries.length === 1 ? 'trace' : 'traces'} · back to {formatSpineDate(pastEntries[pastEntries.length - 1])}</small><i aria-hidden="true">＋</i></summary>
+								<div class="behind-content">{#each pastEntries as entry (entry.id)}{@render spineTrace(entry, 'past')}{/each}<button class="open-archive" type="button" onclick={showTimeline}>Open the archive <span>→</span></button></div>
 							</details>
 						{/if}
 					</div>
@@ -1272,7 +1320,7 @@
 		{#if activeTab === 'upcoming'}
 			<section class="upcoming-screen" aria-labelledby="upcoming-title">
 				<header class="upcoming-header">
-					<div><p class="eyebrow">Things that need attention</p><h1 id="upcoming-title">Upcoming</h1></div>
+					<div><p class="eyebrow">Things to act on</p><h1 id="upcoming-title">Plans</h1></div>
 					<span>{actionableEntries.length}</span>
 				</header>
 
@@ -1294,13 +1342,11 @@
 									{#each group.entries as entry (entry.id)}
 										<article class={`upcoming-item ${entry.destination.toLowerCase()}`}>
 											<div class="upcoming-item-top"><span class="upcoming-symbol">{entry.destination === 'Calendar' ? '▦' : '!'}</span><div><div class="upcoming-meta"><span>{entry.destination}</span><i>·</i><span>{entry.category}</span></div><h3>{entry.title}</h3></div></div>
-											<p class="upcoming-detail">{entry.detail}</p>
+											<p class="upcoming-detail">“{entry.transcript}”</p>
 											<div class="upcoming-facts">
 												<span><i>◷</i>{entry.scheduledDate ? formatScheduledDate(entry.scheduledDate) : 'Date needed'}{entry.scheduledTime ? ` at ${formatClockTime(entry.scheduledTime)}` : ' · All day'}</span>
 												{#if entry.destination === 'Calendar' && entry.durationMinutes}<span><i>↔</i>{entry.durationMinutes} minutes</span>{/if}
-												{#if entry.destination === 'Calendar' && entry.reminderMinutes !== undefined}<span><i>!</i>{entry.reminderMinutes === 0 ? 'Notify at start' : `Notify ${entry.reminderMinutes} min before`}</span>{/if}
 											</div>
-											<div class="sync-line"><span></span>Waiting for {entry.externalProvider || (entry.destination === 'Calendar' ? 'Google Calendar' : 'Google Tasks')}</div>
 											<div class="upcoming-actions">
 												<button type="button" onclick={() => beginEntryEdit(entry)}>{entry.scheduledDate ? 'Reschedule or edit' : 'Add a date'}</button>
 												{#if entry.destination === 'Reminder'}<button class="complete" type="button" onclick={() => completeReminder(entry)}>Mark done</button>{/if}
@@ -1416,7 +1462,6 @@
 							{#if editingEntry.category === 'Place'}
 								<label class="wide">Address or area<input bind:value={editingEntry.placeAddress} placeholder="Optional, e.g. Vesterbro, Copenhagen" /></label>
 							{/if}
-							<label>When<input bind:value={editingEntry.when} required /></label>
 							<label>Destination<select bind:value={editingEntry.destination}>{#each destinations as destination}<option value={destination}>{destination}</option>{/each}</select></label>
 							{#if editingEntry.destination !== 'Timeline'}
 								<label>Scheduled date<input type="date" bind:value={editingEntry.scheduledDate} required /></label>
@@ -1424,7 +1469,6 @@
 							{/if}
 							{#if editingEntry.destination === 'Calendar'}
 								<label>Duration<select bind:value={editingEntry.durationMinutes}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={90}>1½ hours</option><option value={120}>2 hours</option><option value={180}>3 hours</option></select></label>
-								<label>Notify<select bind:value={editingEntry.reminderMinutes}><option value={0}>At start</option><option value={10}>10 minutes before</option><option value={30}>30 minutes before</option><option value={60}>1 hour before</option><option value={1440}>1 day before</option></select></label>
 							{/if}
 							{#if editingEntry.category === 'Social'}
 								<label class="wide">People<input bind:value={editingPeople} placeholder="Michael, Jennifer" /></label>
@@ -1440,7 +1484,7 @@
 								{#if placeLocationMessage}<p class:error={placeLocationState === 'error'}>{placeLocationMessage}</p>{/if}
 							</section>
 						{/if}
-					{#if editingEntry.destination !== 'Timeline'}<p class="edit-route-note"><span>↗</span>Ready for {editingEntry.destination === 'Reminder' && !editingEntry.scheduledTime ? 'Google Tasks' : 'Google Calendar'} connection</p>{/if}
+					{#if editingEntry.destination !== 'Timeline'}<p class="edit-route-note"><span>○</span>Saved only in Trace. Google connection is not enabled yet.</p>{/if}
 						<p class="edit-captured-at">Originally captured {formatDateTime24(editingEntry.capturedAt)}</p>
 						<div class="sheet-actions"><button type="button" onclick={() => (editingEntry = null)}>Cancel</button><button class="confirm" type="submit">Save changes</button></div>
 					</form>
@@ -1458,7 +1502,7 @@
 						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select><span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
 						{#if showDraftDetails && draft.classificationReason}<p class="classification-reason"><span>⌁</span>{draft.classificationReason} · {draft.classificationConfidence || 'Low'} confidence</p>{/if}
 						{#if editing}
-							<div class="edit-fields"><label>Title<input bind:value={draft.title} /></label><label>Detail<input bind:value={draft.detail} /></label><label>When<input bind:value={draft.when} /></label></div>
+							<div class="edit-fields"><label>Title<input bind:value={draft.title} /></label><label>Detail<input bind:value={draft.detail} /></label></div>
 						{:else}
 							<div class="entry-summary"><strong>{draft.title}</strong>{#if draft.category === 'Social'}<div class="event-facts"><div><span>People</span><b>{draft.people?.join(' & ') || 'Not specified'}</b></div><div><span>Date</span><b>{draft.when}</b></div><div><span>Time</span><b>{draft.scheduledTime ? formatClockTime(draft.scheduledTime) : 'Not specified'}</b></div></div>{:else}<p>{draft.detail}</p><span>{draft.when}</span>{/if}</div>
 						{/if}
@@ -1516,15 +1560,14 @@
 								<label>Time <small>{draft.destination === 'Calendar' ? 'optional for all-day' : 'optional for date-only'}</small><input type="time" bind:value={draft.scheduledTime} onchange={() => { draftTimeConfirmed = true; updateDraftProvider(); }} /></label>
 								{#if draft.destination === 'Calendar'}
 									<label>Duration<select bind:value={draft.durationMinutes}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={90}>1½ hours</option><option value={120}>2 hours</option><option value={180}>3 hours</option></select></label>
-									<label>Notify<select bind:value={draft.reminderMinutes}><option value={0}>At start</option><option value={10}>10 minutes before</option><option value={30}>30 minutes before</option><option value={60}>1 hour before</option><option value={1440}>1 day before</option></select></label>
 								{/if}
 							</div>
-							<div class="google-route-note"><span>G</span><div><b>Ready for {draft.destination === 'Reminder' && !draft.scheduledTime ? 'Google Tasks' : 'Google Calendar'}</b><small>The route is stored now; Google authorization and synchronization come next.</small></div></div>
+							<div class="google-route-note"><span>○</span><div><b>Saved in Trace only</b><small>Nothing will be sent to Google until you choose to connect it later.</small></div></div>
 						{/if}
 					</div>
-					<p class="learning-note"><span>↻</span> Corrections help Trace understand your language over time.</p>{/if}
+					{/if}
 					{#if draftSaveError}<p class="draft-save-error" role="alert"><span>!</span>{draftSaveError}</p>{/if}
-					<div class="sheet-actions confirmation-actions"><button type="button" disabled={savingDraft} onclick={() => (editing = !editing)}>{editing ? 'Done editing' : 'Edit'}</button><button class="confirm" type="button" disabled={savingDraft} onclick={confirmDraft}>{savingDraft ? 'Saving…' : draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length}` : 'Confirm'}</button></div>
+					<div class="sheet-actions confirmation-actions"><button type="button" disabled={savingDraft} onclick={() => (editing = !editing)}>{editing ? 'Done editing' : 'Edit'}</button><button class="confirm" type="button" disabled={savingDraft} onclick={confirmDraft}>{savingDraft ? 'Saving…' : draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length}` : 'Looks right'}</button></div>
 				</div>
 			</div>
 		{/if}
