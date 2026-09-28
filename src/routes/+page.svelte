@@ -8,11 +8,19 @@
 		type TimelineEntry
 	} from '$lib/entry';
 	import { deleteLocalEntry, listLocalEntries, saveLocalEntries, saveLocalEntry } from '$lib/local-entries';
+	import { dateKeyAfter, describeSchedule, localDateKey, parseDateKey, relativeDayLabel } from '$lib/dates';
+	import {
+		INSIGHT_CATEGORIES,
+		computeInsights,
+		entryCaptureDateKey,
+		entryDateKey,
+		wellbeingScoreOf,
+		type InsightRange
+	} from '$lib/insights';
 
 	type CaptureState = 'idle' | 'requesting' | 'listening' | 'processing';
 	type CaptureLanguage = 'da-DK' | 'en-US';
 	type ActiveTab = 'today' | 'timeline' | 'upcoming' | 'insights';
-	type InsightRange = 7 | 30 | 'all';
 	type TimelineFilter = EntryCategory | 'All';
 	type NoticeAction = 'undo' | 'capture' | null;
 	type UpcomingGroup = {
@@ -52,8 +60,22 @@
 	};
 
 	const bars = [12, 20, 31, 17, 39, 24, 45, 28, 36, 18, 29, 14];
-	const insightCategories: EntryCategory[] = ['Wellbeing', 'Habit', 'Reminder', 'Place', 'Social', 'Note'];
+	const insightCategories = INSIGHT_CATEGORIES;
 	const destinations: EntryDestination[] = ['Timeline', 'Calendar', 'Reminder'];
+	const wellbeingScores = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+	// Placeholder details say nothing the category does not already say, so lists leave them out.
+	const fillerDetails = new Set([
+		'General timeline entry',
+		'Reminder saved in Trace',
+		'Activity logged',
+		'Activity planned',
+		'Wellbeing noted',
+		'Tinnitus noted',
+		'Place to revisit',
+		'Social event',
+		'Saved place'
+	]);
+	const DATE_REPAIR_KEY = 'trace-date-repair-v2';
 	const legacyInferredWellbeingDetails = new Set([
 		'3 / 10 · Mild',
 		'5 / 10 · Moderate',
@@ -85,8 +107,12 @@
 	let recentlyDeleted = $state<TimelineEntry | null>(null);
 	let editingEntry = $state<TimelineEntry | null>(null);
 	let editingPeople = $state('');
+	let editingScore = $state('');
 	let editInterpretationMessage = $state('');
 	let draftTimeConfirmed = $state(false);
+	let editError = $state('');
+	let storagePersisted = $state<boolean | null>(null);
+	let todayKey = $state(localDateKey(new Date()));
 	let showDataTools = $state(false);
 	let backupMessage = $state('');
 	let backupError = $state('');
@@ -113,14 +139,15 @@
 	let restartTimeout: number | undefined;
 	let noticeTimeout: number | undefined;
 
-	const day = new Intl.DateTimeFormat('en', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date());
+	const day = $derived(
+		new Intl.DateTimeFormat('en-GB', { weekday: 'long', month: 'long', day: 'numeric' }).format(parseDateKey(todayKey))
+	);
 	const statusCopy = $derived(
 		captureState === 'requesting' ? 'Opening microphone…' :
 		captureState === 'listening' ? 'Listening… tap when done' :
 		captureState === 'processing' ? 'Finishing capture…' :
 		'Tap once, then speak naturally'
 	);
-	const todayKey = localDateAfter(0);
 	const todayEntries = $derived(timeline.filter((entry) => entryTimelineDate(entry) === todayKey));
 	const todaySpineEntries = $derived([...todayEntries].sort(compareTimelineDateAscending));
 	const overdueAttentionEntries = $derived(
@@ -141,60 +168,11 @@
 			.filter((entry) => entryTimelineDate(entry) < todayKey && !overdueAttentionEntries.some((attention) => attention.id === entry.id))
 			.sort(compareTimelineDateDescending)
 	);
-	const aheadPreviewGroups = $derived(groupTimelineEntries(aheadEntries.slice(0, 4), 'asc'));
-	const pastGroups = $derived(groupTimelineEntries(pastEntries, 'desc'));
-	const latestWellbeing = $derived(todayEntries.find((entry) => entry.category === 'Wellbeing'));
-	const habitCount = $derived(todayEntries.filter((entry) => entry.category === 'Habit').length);
-	const insightEntries = $derived.by(() => {
-		if (insightRange === 'all') return timeline;
-		const cutoff = Date.now() - insightRange * 24 * 60 * 60 * 1000;
-		return timeline.filter((entry) => Date.parse(entry.capturedAt) >= cutoff);
-	});
-	const insightStats = $derived.by(() => {
-		const wellbeingScores = insightEntries
-			.filter((entry) => entry.category === 'Wellbeing')
-			.map((entry) => Number(entry.detail.match(/(\d+(?:\.\d+)?)\s*\/\s*10/)?.[1]))
-			.filter((score) => Number.isFinite(score));
-		const habitEntries = insightEntries.filter((entry) => entry.category === 'Habit');
-		const habitMinutes = habitEntries.reduce((total, entry) => {
-			const minutes = Number(entry.detail.match(/(\d+)\s*minutes?/i)?.[1]);
-			return total + (Number.isFinite(minutes) ? minutes : 0);
-		}, 0);
-		const categoryCounts = insightCategories.map((category) => {
-			const count = insightEntries.filter((entry) => entry.category === category).length;
-			return {
-				category,
-				count,
-				percentage: insightEntries.length ? Math.round((count / insightEntries.length) * 100) : 0
-			};
-		});
-		return {
-			activeDays: new Set(insightEntries.map((entry) => entry.capturedAt.slice(0, 10))).size,
-			averageWellbeing: wellbeingScores.length
-				? wellbeingScores.reduce((total, score) => total + score, 0) / wellbeingScores.length
-				: null,
-			wellbeingCount: wellbeingScores.length,
-			habitCount: habitEntries.length,
-			habitMinutes,
-			reminderCount: insightEntries.filter((entry) => entry.destination === 'Reminder').length,
-			categoryCounts
-		};
-	});
-	const lastSevenDays = $derived.by(() => {
-		const today = new Date();
-		today.setHours(0, 0, 0, 0);
-		const key = (value: Date) => `${value.getFullYear()}-${value.getMonth()}-${value.getDate()}`;
-		return Array.from({ length: 7 }, (_, index) => {
-			const date = new Date(today);
-			date.setDate(today.getDate() - (6 - index));
-			return {
-				label: new Intl.DateTimeFormat('en', { weekday: 'short' }).format(date).slice(0, 1),
-				count: timeline.filter((entry) => key(new Date(entry.capturedAt)) === key(date)).length
-			};
-		});
-	});
-	const maxDailyEntries = $derived(Math.max(1, ...lastSevenDays.map((item) => item.count)));
-	const insightRangeLabel = $derived(insightRange === 'all' ? 'All time' : `Last ${insightRange} days`);
+	const insights = $derived(computeInsights(timeline, insightRange, todayKey));
+	const maxInsightBar = $derived(Math.max(1, ...insights.bars.map((bar) => bar.count)));
+	const insightRangeLabel = $derived(
+		insightRange === 'all' ? (insights.weeksCapped ? 'Last 26 weeks' : 'All time') : `Last ${insightRange} days`
+	);
 	const filteredTimeline = $derived.by(() => {
 		const query = timelineQuery.trim().toLocaleLowerCase();
 		return timeline.filter((entry) => {
@@ -204,7 +182,6 @@
 				entry.title,
 				entry.detail,
 				entry.transcript,
-				entry.when,
 				entry.category,
 				entry.destination,
 				entry.placeAddress,
@@ -214,36 +191,15 @@
 	});
 	const timelineGroups = $derived(groupTimelineEntries(filteredTimeline, 'desc'));
 	const availableTimelineCategories = $derived(insightCategories.filter((category) => timeline.some((entry) => entry.category === category)));
-	const weeklyStories = $derived.by(() => {
-		const now = Date.now();
-		const week = 7 * 24 * 60 * 60 * 1000;
-		const current = timeline.filter((entry) => Date.parse(entry.capturedAt) >= now - week);
-		const previous = timeline.filter((entry) => {
-			const captured = Date.parse(entry.capturedAt);
-			return captured >= now - week * 2 && captured < now - week;
-		});
-		const habits = current.filter((entry) => entry.category === 'Habit');
-		const habitMinutes = habits.reduce((total, entry) => total + (Number(entry.detail.match(/(\d+)\s*minutes?/i)?.[1]) || 0), 0);
-		const socialCount = current.filter((entry) => entry.category === 'Social').length;
-		const previousSocial = previous.filter((entry) => entry.category === 'Social').length;
-		const openReminders = timeline.filter((entry) => entry.destination === 'Reminder' && entry.status !== 'Completed').length;
-		const activeDays = new Set(current.map((entry) => entryCaptureDate(entry))).size;
-		return [
-			current.length
-				? `You captured ${current.length} ${current.length === 1 ? 'trace' : 'traces'} across ${activeDays} ${activeDays === 1 ? 'day' : 'days'} this week.`
-				: 'Your next capture will begin this week’s story.',
-			habits.length
-				? `${habits.length} ${habits.length === 1 ? 'activity' : 'activities'} logged${habitMinutes ? `, totalling ${habitMinutes} minutes` : ''}.`
-				: 'No exercise or habit activity has been logged this week.',
-			socialCount === previousSocial
-				? `${socialCount} social ${socialCount === 1 ? 'moment' : 'moments'} captured this week.`
-				: `${socialCount} social ${socialCount === 1 ? 'moment' : 'moments'} this week, ${socialCount > previousSocial ? 'more' : 'fewer'} than last week.`,
-			openReminders ? `${openReminders} ${openReminders === 1 ? 'reminder needs' : 'reminders need'} your attention.` : 'You have no open reminders.'
-		];
-	});
+	// A calendar event whose day has passed has happened; only reminders can be overdue.
 	const actionableEntries = $derived.by(() =>
 		timeline
-			.filter((entry) => entry.destination !== 'Timeline' && entry.status !== 'Completed')
+			.filter(
+				(entry) =>
+					entry.status !== 'Completed' &&
+					(entry.destination === 'Reminder' ||
+						(entry.destination === 'Calendar' && (!entry.scheduledDate || entry.scheduledDate >= todayKey)))
+			)
 			.sort((left, right) => {
 				const leftValue = `${left.scheduledDate || '9999-12-31'}T${formatClockTime(left.scheduledTime) || '23:59'}`;
 				const rightValue = `${right.scheduledDate || '9999-12-31'}T${formatClockTime(right.scheduledTime) || '23:59'}`;
@@ -254,21 +210,10 @@
 		if (timeline.length < 25) return false;
 		if (!lastBackupAt) return true;
 		const lastBackup = Date.parse(lastBackupAt);
-		return !Number.isFinite(lastBackup) || Date.now() - lastBackup >= 14 * 24 * 60 * 60 * 1000;
+		return !Number.isFinite(lastBackup) || Date.parse(`${todayKey}T23:59:59`) - lastBackup >= 14 * 24 * 60 * 60 * 1000;
 	});
 	const upcomingGroups = $derived.by(() => {
-		const today = new Date();
-		today.setHours(0, 0, 0, 0);
-		const tomorrow = new Date(today);
-		tomorrow.setDate(tomorrow.getDate() + 1);
-		const dateKey = (value: Date) => {
-			const year = value.getFullYear();
-			const month = String(value.getMonth() + 1).padStart(2, '0');
-			const day = String(value.getDate()).padStart(2, '0');
-			return `${year}-${month}-${day}`;
-		};
-		const todayKey = dateKey(today);
-		const tomorrowKey = dateKey(tomorrow);
+		const tomorrowKey = localDateAfter(1);
 		const groups: UpcomingGroup[] = [
 			{ key: 'overdue', label: 'Overdue', entries: [] },
 			{ key: 'today', label: 'Today', entries: [] },
@@ -289,6 +234,16 @@
 			groups.find((group) => group.key === groupKey)?.entries.push(entry);
 		}
 		return groups.filter((group) => group.entries.length > 0);
+	});
+	const overlayOpen = $derived(Boolean(captureOpen || draft || editingEntry || showDataTools));
+	const draftWhen = $derived.by(() => {
+		if (!draft) return '';
+		if (draft.scheduledDates && draft.scheduledDates.length > 1) {
+			return `${draft.scheduledDates.length} dates${draft.scheduledTime ? ` · ${formatClockTime(draft.scheduledTime)}` : ''}`;
+		}
+		if (draft.scheduledDate) return describeSchedule(draft.scheduledDate, formatClockTime(draft.scheduledTime), todayKey);
+		if (draft.destination !== 'Timeline') return draft.scheduledTime ? `Date needed · ${formatClockTime(draft.scheduledTime)}` : 'Date needed';
+		return `Today${draft.scheduledTime ? ` · ${formatClockTime(draft.scheduledTime)}` : ''}`;
 	});
 	const draftClarification = $derived.by<DraftClarification | null>(() => {
 		if (!draft || draft.destination === 'Timeline') return null;
@@ -319,11 +274,45 @@
 		return { ...entry, detail, syncStatus: 'Local' as const };
 	}
 
+	// Timeline dates used to come straight from the parser and could not be edited, so a tinnitus score of
+	// "7/10" was filed on 7 October and "went running on Monday" landed next week. Re-read those dates once
+	// with the current parser, from the moment each entry was captured.
+	function repairParsedDate(entry: TimelineEntry) {
+		if (entry.destination !== 'Timeline' || entry.seriesId || entry.destinationConfidence === 'User selected') return entry;
+		const capturedAt = new Date(entry.capturedAt);
+		if (!entry.transcript.trim() || Number.isNaN(capturedAt.getTime())) return entry;
+		const reread = interpretEntry(entry.transcript, capturedAt);
+		if (reread.scheduledDates || (reread.scheduledDate || undefined) === (entry.scheduledDate || undefined)) return entry;
+		return { ...entry, scheduledDate: reread.scheduledDate };
+	}
+
 	async function loadStoredEntries() {
 		const entries = await listLocalEntries();
-		const sanitized = entries.map(sanitizeLegacyEntry);
+		const repairDates = window.localStorage.getItem(DATE_REPAIR_KEY) !== 'done';
+		const sanitized = entries.map((entry) => {
+			const cleaned = sanitizeLegacyEntry(entry);
+			return repairDates ? repairParsedDate(cleaned) : cleaned;
+		});
 		if (sanitized.some((entry, index) => entry !== entries[index])) await saveLocalEntries(sanitized);
+		if (repairDates) window.localStorage.setItem(DATE_REPAIR_KEY, 'done');
 		timeline = sanitized;
+		if (sanitized.length) void protectStorage();
+	}
+
+	// Chrome may evict site data under storage pressure unless the origin holds persistent storage.
+	// Installed PWAs are usually granted it without a prompt.
+	async function protectStorage() {
+		if (!navigator.storage?.persist) return;
+		try {
+			storagePersisted = (await navigator.storage.persisted()) || (await navigator.storage.persist());
+		} catch {
+			storagePersisted = false;
+		}
+	}
+
+	function refreshToday() {
+		const key = localDateKey(new Date());
+		if (key !== todayKey) todayKey = key;
 	}
 
 	onMount(() => {
@@ -347,14 +336,17 @@
 				captureOpen = true;
 			}
 		}
-		if (captureMode || checkin) window.history.replaceState(null, '', window.location.pathname);
+		if (launch.search) window.history.replaceState(null, '', window.location.pathname);
 		window.requestAnimationFrame(() => {
 			if (showManual) manualInput?.focus();
 		});
 		void loadStoredEntries()
 			.catch(() => (notice = 'Saved entries could not be opened on this device'))
 			.finally(() => (loadingEntries = false));
+		// An installed PWA can stay in memory overnight. Keep "Today" pointing at today.
+		const clockTimer = window.setInterval(refreshToday, 60_000);
 		return () => {
+			window.clearInterval(clockTimer);
 			if (stopTimeout !== undefined) window.clearTimeout(stopTimeout);
 			if (restartTimeout !== undefined) window.clearTimeout(restartTimeout);
 			if (noticeTimeout !== undefined) window.clearTimeout(noticeTimeout);
@@ -362,6 +354,35 @@
 			stream?.getTracks().forEach((track) => track.stop());
 		};
 	});
+
+	// Android's back gesture should close the open sheet, not leave the app.
+	let overlayHistoryEntry = false;
+	$effect(() => {
+		if (overlayOpen && !overlayHistoryEntry) {
+			window.history.pushState({ traceOverlay: true }, '');
+			overlayHistoryEntry = true;
+		} else if (!overlayOpen && overlayHistoryEntry) {
+			overlayHistoryEntry = false;
+			if (window.history.state?.traceOverlay) window.history.back();
+		}
+	});
+
+	function handlePopState(event: PopStateEvent) {
+		if (!overlayHistoryEntry || event.state?.traceOverlay) return;
+		overlayHistoryEntry = false;
+		closeTopOverlay();
+	}
+
+	function handleKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape' && overlayOpen) closeTopOverlay();
+	}
+
+	function closeTopOverlay() {
+		if (draft) dismissDraft();
+		else if (editingEntry) closeEntryEditor();
+		else if (showDataTools) showDataTools = false;
+		else if (captureOpen) closeCapture();
+	}
 
 	function haptic(pattern: number | number[] = 10) {
 		if ('vibrate' in navigator) navigator.vibrate(pattern);
@@ -450,6 +471,14 @@
 		stopTimeout = undefined;
 		restartTimeout = undefined;
 		recognition = null;
+		const speechWindow = window as SpeechWindow;
+		const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
+		if (!Recognition) {
+			// Without speech recognition there is nothing to turn audio into text, so do not pretend to record.
+			setCaptureMethod('type');
+			captureMessage = 'This browser cannot turn speech into text. Type, or tap the microphone on your keyboard.';
+			return;
+		}
 		captureState = 'requesting';
 		try {
 			stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
@@ -457,13 +486,6 @@
 			if (typeof MediaRecorder !== 'undefined') {
 				recorder = new MediaRecorder(stream);
 				recorder.start();
-			}
-			const speechWindow = window as SpeechWindow;
-			const Recognition = speechWindow.SpeechRecognition || speechWindow.webkitSpeechRecognition;
-			if (!Recognition) {
-				captureState = 'listening';
-				captureMessage = 'Recording audio. Tap again when you are finished.';
-				return;
 			}
 			recognition = new Recognition();
 			recognition.lang = captureLanguage;
@@ -707,17 +729,11 @@
 	}
 
 	function localDateAfter(days: number) {
-		const date = new Date();
-		date.setHours(12, 0, 0, 0);
-		date.setDate(date.getDate() + days);
-		const year = date.getFullYear();
-		const month = String(date.getMonth() + 1).padStart(2, '0');
-		const day = String(date.getDate()).padStart(2, '0');
-		return `${year}-${month}-${day}`;
+		return dateKeyAfter(days, parseDateKey(todayKey));
 	}
 
 	function entryTimelineDate(entry: TimelineEntry) {
-		return entry.scheduledDate || entryCaptureDate(entry);
+		return entryDateKey(entry);
 	}
 
 	function compareTimelineDateAscending(left: TimelineEntry, right: TimelineEntry) {
@@ -731,10 +747,8 @@
 	}
 
 	function groupTimelineEntries(entries: TimelineEntry[], direction: 'asc' | 'desc') {
-		const today = localDateAfter(0);
-		const tomorrow = localDateAfter(1);
-		const yesterday = localDateAfter(-1);
-		const formatter = new Intl.DateTimeFormat('en', { weekday: 'long', month: 'short', day: 'numeric' });
+		const nearby = new Set([localDateAfter(-1), todayKey, localDateAfter(1)]);
+		const formatter = new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'short' });
 		const groups = new Map<string, TimelineEntry[]>();
 		for (const entry of entries) {
 			const key = entryTimelineDate(entry);
@@ -744,13 +758,7 @@
 			.sort(([left], [right]) => direction === 'asc' ? left.localeCompare(right) : right.localeCompare(left))
 			.map(([key, groupedEntries]) => ({
 				key,
-				label: key === today
-					? 'Today'
-					: key === tomorrow
-						? 'Tomorrow'
-						: key === yesterday
-							? 'Yesterday'
-							: formatter.format(new Date(`${key}T12:00:00`)),
+				label: nearby.has(key) ? relativeDayLabel(key, todayKey) : formatter.format(parseDateKey(key)),
 				entries: [...groupedEntries].sort(direction === 'asc' ? compareTimelineDateAscending : compareTimelineDateDescending)
 			}));
 	}
@@ -784,8 +792,39 @@
 		if (!draft) return;
 		draft.scheduledTime = value;
 		draft.eventTime = value;
+		draft.scheduledTimeAssumed = undefined;
+		draft.scheduledTimeAlternative = undefined;
 		draftTimeConfirmed = true;
 		updateDraftProvider();
+	}
+
+	function useAlternativeTime() {
+		if (draft?.scheduledTimeAlternative) setDraftTime(draft.scheduledTimeAlternative);
+	}
+
+	function setDraftScore(score: number) {
+		if (!draft) return;
+		const clearing = draft.wellbeingScore === score;
+		draft.wellbeingScore = clearing ? undefined : score;
+		draft.detail = clearing ? (/tinnitus/i.test(draft.transcript) ? 'Tinnitus noted' : 'Wellbeing noted') : `${score} / 10`;
+	}
+
+	// Closing the confirmation goes back to the capture sheet with the text intact, so rephrasing is one step.
+	function dismissDraft() {
+		if (!draft) return;
+		const typed = showManual;
+		if (typed) manualText = draft.transcript;
+		draft = null;
+		editing = false;
+		showDraftDetails = false;
+		draftSaveError = '';
+		if (typed) window.requestAnimationFrame(() => manualInput?.focus());
+	}
+
+	function closeEntryEditor() {
+		editingEntry = null;
+		editError = '';
+		editInterpretationMessage = '';
 	}
 
 	function isBackupEntry(value: unknown): value is TimelineEntry {
@@ -906,7 +945,7 @@
 		if (!value) return 'Date needed';
 		const date = new Date(`${value}T12:00:00`);
 		if (Number.isNaN(date.getTime())) return value;
-		return new Intl.DateTimeFormat('en', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }).format(date);
+		return new Intl.DateTimeFormat('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }).format(date);
 	}
 
 	function formatSpineDate(entry: TimelineEntry) {
@@ -920,27 +959,19 @@
 		return formatClockTime(entry.scheduledTime || entry.time) || '—';
 	}
 
-	function entryCaptureDate(entry: TimelineEntry) {
-		const date = new Date(entry.capturedAt);
-		const year = date.getFullYear();
-		const month = String(date.getMonth() + 1).padStart(2, '0');
-		const day = String(date.getDate()).padStart(2, '0');
-		return `${year}-${month}-${day}`;
+	function entryDetail(entry: TimelineEntry) {
+		return fillerDetails.has(entry.detail) ? '' : entry.detail;
 	}
 
-	function displayEntryDetail(entry: TimelineEntry) {
-		if (
-			entry.category === 'Habit' &&
-			entry.detail === 'Activity logged' &&
-			entry.scheduledDate &&
-			entry.scheduledDate > entryCaptureDate(entry)
-		) return 'Activity planned';
-		return entry.detail;
+	/** The time (when asked) and any detail that says more than the category does. Lists show the day elsewhere. */
+	function entrySummary(entry: TimelineEntry, showTime = true) {
+		return [showTime && entry.scheduledTime ? formatClockTime(entry.scheduledTime) : '', entryDetail(entry)]
+			.filter(Boolean)
+			.join(' · ');
 	}
 
-	function displayEntryTiming(entry: TimelineEntry) {
-		if (!entry.scheduledDate) return entry.when;
-		return `${formatScheduledDate(entry.scheduledDate)}${entry.scheduledTime ? ` at ${formatClockTime(entry.scheduledTime)}` : ''}`;
+	function showsDestination(entry: TimelineEntry) {
+		return entry.destination !== 'Timeline' && entry.destination !== entry.category;
 	}
 
 	async function confirmDraft() {
@@ -955,6 +986,8 @@
 			return;
 		}
 		if (draft.destination !== 'Timeline' && !draft.status) draft.status = 'Planned';
+		draft.scheduledDate = draft.scheduledDate || undefined;
+		draft.scheduledTime = draft.scheduledTime || undefined;
 		draft.calendar = draft.destination === 'Calendar';
 		draft.reminder = draft.destination === 'Reminder';
 		draft.eventTime = draft.scheduledTime;
@@ -977,6 +1010,7 @@
 		const entries: TimelineEntry[] = (datesToSave.length ? datesToSave : [undefined]).map((scheduledDate, index) => ({
 			...draftFields,
 			scheduledDate,
+			when: scheduledDate ? `${formatScheduledDate(scheduledDate)}${draftFields.scheduledTime ? ` at ${draftFields.scheduledTime}` : ''}` : 'Captured',
 			seriesId,
 			occurrenceIndex: seriesId ? index : undefined,
 			occurrenceCount: seriesId ? datesToSave.length : undefined,
@@ -987,6 +1021,7 @@
 		try {
 			await saveLocalEntries(entries);
 			timeline = [...entries, ...timeline];
+			if (storagePersisted !== true) void protectStorage();
 			draft = null;
 			captureOpen = false;
 			editing = false;
@@ -994,7 +1029,7 @@
 			haptic([10, 35, 18]);
 			showToast(
 				entries.length > 1
-					? `${entries.length} upcoming traces saved`
+					? `${entries.length} traces saved`
 					: entries[0].destination === 'Timeline' ? `${entries[0].category} saved` : 'Plan saved in Trace',
 				'capture',
 				5200
@@ -1051,7 +1086,9 @@
 			scheduledTime: formatClockTime(entry.scheduledTime || entry.eventTime)
 		};
 		editingPeople = entry.people?.join(', ') || '';
+		editingScore = String(wellbeingScoreOf(entry) ?? '');
 		editInterpretationMessage = '';
+		editError = '';
 		placeLocationState = entry.latitude !== undefined && entry.longitude !== undefined ? 'attached' : 'idle';
 		placeLocationMessage = entry.latitude !== undefined && entry.longitude !== undefined
 			? `Position attached${entry.locationAccuracy ? ` · accurate to about ${entry.locationAccuracy} m` : ''}.`
@@ -1076,6 +1113,7 @@
 			status: interpreted.status || (interpreted.destination !== 'Timeline' ? 'Planned' : undefined)
 		};
 		editingPeople = interpreted.people?.join(', ') || '';
+		editingScore = String(interpreted.wellbeingScore ?? '');
 		editInterpretationMessage = 'Capture reinterpreted. Review the updated fields below.';
 	}
 
@@ -1084,11 +1122,27 @@
 		if (!editingEntry) return;
 		const original = timeline.find((entry) => entry.id === editingEntry?.id);
 		const categoryChanged = original?.category !== editingEntry.category;
+		const scheduledDate = editingEntry.scheduledDate || undefined;
+		const scheduledTime = editingEntry.scheduledTime || undefined;
+		const timeChanged = scheduledTime !== (original?.scheduledTime || undefined);
+		const score = editingEntry.category === 'Wellbeing' && editingScore !== '' ? Number(editingScore) : undefined;
+		const scoreShaped = /^\d+(?:\.\d+)?\s*\/\s*10$/.test(editingEntry.detail.trim()) || fillerDetails.has(editingEntry.detail.trim());
+		const detail =
+			editingEntry.category === 'Wellbeing' && scoreShaped && score !== (original ? wellbeingScoreOf(original) : undefined)
+				? score !== undefined
+					? `${score} / 10`
+					: /tinnitus/i.test(editingEntry.transcript) ? 'Tinnitus noted' : 'Wellbeing noted'
+				: editingEntry.detail.trim();
 		const updated: TimelineEntry = {
 			...editingEntry,
 			title: editingEntry.title.trim(),
-			detail: editingEntry.detail.trim(),
-			when: editingEntry.when.trim() || (editingEntry.scheduledDate ? formatScheduledDate(editingEntry.scheduledDate) : 'Captured'),
+			detail,
+			scheduledDate,
+			scheduledTime,
+			scheduledTimeAssumed: timeChanged ? undefined : editingEntry.scheduledTimeAssumed,
+			scheduledTimeAlternative: timeChanged ? undefined : editingEntry.scheduledTimeAlternative,
+			wellbeingScore: score,
+			when: scheduledDate ? `${formatScheduledDate(scheduledDate)}${scheduledTime ? ` at ${scheduledTime}` : ''}` : 'Captured',
 			people: editingEntry.category === 'Social'
 				? editingPeople.split(/,|\band\b/i).map((person) => person.trim()).filter(Boolean)
 				: undefined,
@@ -1096,11 +1150,11 @@
 			classificationReason: categoryChanged ? 'Category changed after capture' : editingEntry.classificationReason,
 			calendar: editingEntry.destination === 'Calendar',
 			reminder: editingEntry.destination === 'Reminder',
-			eventTime: editingEntry.scheduledTime,
+			eventTime: scheduledTime,
 			externalProvider: editingEntry.destination === 'Calendar'
 				? 'Google Calendar'
 				: editingEntry.destination === 'Reminder'
-					? (editingEntry.scheduledTime ? 'Google Calendar' : 'Google Tasks')
+					? (scheduledTime ? 'Google Calendar' : 'Google Tasks')
 					: undefined,
 			syncStatus: 'Local'
 		};
@@ -1117,15 +1171,21 @@
 			updated.mapsSearchUrl = undefined;
 			updated.mapsPinUrl = undefined;
 		}
-		if (!updated.title || !updated.detail || (updated.destination !== 'Timeline' && !updated.scheduledDate)) return;
+		editError = !updated.title
+			? 'Add a title before saving.'
+			: !updated.detail
+				? 'Add details before saving.'
+				: updated.destination !== 'Timeline' && !updated.scheduledDate
+					? `Add a date, or choose Timeline instead of ${updated.destination}.`
+					: '';
+		if (editError) return;
 		try {
 			await saveLocalEntry(updated);
 			timeline = timeline.map((entry) => (entry.id === updated.id ? updated : entry));
-			editingEntry = null;
-			editInterpretationMessage = '';
+			closeEntryEditor();
 			showToast('Entry updated');
 		} catch {
-			showToast('That entry could not be updated');
+			editError = 'That entry could not be saved. Please try again.';
 		}
 	}
 
@@ -1152,9 +1212,7 @@
 
 	function showTimeline() {
 		activeTab = 'timeline';
-		window.requestAnimationFrame(() => {
-			document.querySelector('.timeline-section')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-		});
+		window.scrollTo({ top: 0 });
 	}
 
 	function showInsights() {
@@ -1166,19 +1224,27 @@
 	}
 </script>
 
+{#snippet entryMenu(entry: TimelineEntry, extraClass = '')}
+	<details class={`entry-menu ${extraClass}`}><summary aria-label={`More actions for ${entry.title}`}>•••</summary><div><button type="button" onclick={() => beginEntryEdit(entry)}>Edit</button>{#if entry.destination === 'Reminder' && entry.status !== 'Completed'}<button type="button" onclick={() => completeReminder(entry)}>Mark done</button>{/if}<button class="danger" type="button" onclick={() => deleteEntryWithUndo(entry)}>Delete</button></div></details>
+{/snippet}
+
+{#snippet placeLinks(entry: TimelineEntry, extraClass = '')}
+	{#if entry.category === 'Place'}<div class={`place-map-actions ${extraClass}`}><a href={entry.mapsSearchUrl || mapsSearchUrl(entry)} target="_blank" rel="noreferrer"><span>↗</span>Find in Maps</a>{#if entry.latitude !== undefined && entry.longitude !== undefined}<a href={entry.mapsPinUrl || mapsPinUrl(entry)} target="_blank" rel="noreferrer"><span>⌖</span>Captured pin</a>{/if}</div>{/if}
+{/snippet}
+
 {#snippet traceCard(entry: TimelineEntry)}
 	<article class="timeline-item">
 		<button class="timeline-entry-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.transcript}`}>
 			<span class={`category-dot ${entry.category.toLowerCase()}`}></span>
-			<span class="timeline-copy"><span class="timeline-meta"><span>{entry.category}</span><span class={`route-badge ${entry.destination.toLowerCase()}`}>{entry.destination}</span><time>{formatClockTime(entry.time)}</time></span><strong>{entry.transcript}</strong><span class="timeline-description">{displayEntryTiming(entry)} · {displayEntryDetail(entry)}</span></span>
+			<span class="timeline-copy"><span class="timeline-meta"><span>{entry.category}</span>{#if showsDestination(entry)}<span class={`route-badge ${entry.destination.toLowerCase()}`}>{entry.destination}</span>{/if}<time>{formatSpineTime(entry)}</time></span><strong>{entry.transcript}</strong>{#if entrySummary(entry, false)}<span class="timeline-description">{entrySummary(entry, false)}</span>{/if}</span>
 			<span class="timeline-chevron" aria-hidden="true">›</span>
 		</button>
-		<details class="entry-menu"><summary aria-label={`More actions for ${entry.title}`}>•••</summary><div><button type="button" onclick={() => beginEntryEdit(entry)}>Edit</button><button class="danger" type="button" onclick={() => deleteEntryWithUndo(entry)}>Delete</button></div></details>
-		{#if entry.category === 'Place'}<div class="place-map-actions"><a href={entry.mapsSearchUrl || mapsSearchUrl(entry)} target="_blank" rel="noreferrer"><span>↗</span>Find in Maps</a>{#if entry.latitude !== undefined && entry.longitude !== undefined}<a href={entry.mapsPinUrl || mapsPinUrl(entry)} target="_blank" rel="noreferrer"><span>⌖</span>Captured pin</a>{/if}</div>{/if}
+		{@render entryMenu(entry)}
+		{@render placeLinks(entry)}
 	</article>
 {/snippet}
 
-{#snippet spineTrace(entry: TimelineEntry, context: 'today' | 'ahead' | 'past' | 'attention')}
+{#snippet spineTrace(entry: TimelineEntry, context: 'today' | 'ahead' | 'attention')}
 	<article class={`spine-trace ${context}`}>
 		<div class="spine-when">
 			{#if context === 'today'}<time>{formatSpineTime(entry)}</time>{:else}<time>{formatSpineDate(entry)}</time>{/if}
@@ -1187,14 +1253,17 @@
 			<span class={`spine-dot ${entry.category.toLowerCase()}`} aria-hidden="true"></span>
 			<button class="spine-trace-open" type="button" onclick={() => beginEntryEdit(entry)} aria-label={`Open ${entry.transcript}`}>
 				<strong>{entry.transcript}</strong>
-				<span>{displayEntryTiming(entry)} · {displayEntryDetail(entry)}</span>
-				<small><i class={`category-dot ${entry.category.toLowerCase()}`}></i>{entry.category.toUpperCase()}{entry.destination !== 'Timeline' ? ` · ${entry.destination.toUpperCase()}` : ''}</small>
+				{#if entrySummary(entry, context !== 'today')}<span>{entrySummary(entry, context !== 'today')}</span>{/if}
+				<small><i class={`category-dot ${entry.category.toLowerCase()}`}></i>{entry.category.toUpperCase()}{showsDestination(entry) ? ` · ${entry.destination.toUpperCase()}` : ''}</small>
 			</button>
-			<details class="entry-menu spine-menu"><summary aria-label={`More actions for ${entry.title}`}>•••</summary><div><button type="button" onclick={() => beginEntryEdit(entry)}>Edit</button>{#if entry.destination === 'Reminder' && entry.status !== 'Completed'}<button type="button" onclick={() => completeReminder(entry)}>Mark done</button>{/if}<button class="danger" type="button" onclick={() => deleteEntryWithUndo(entry)}>Delete</button></div></details>
-			{#if entry.category === 'Place'}<div class="place-map-actions spine-map-actions"><a href={entry.mapsSearchUrl || mapsSearchUrl(entry)} target="_blank" rel="noreferrer"><span>↗</span>Find in Maps</a>{#if entry.latitude !== undefined && entry.longitude !== undefined}<a href={entry.mapsPinUrl || mapsPinUrl(entry)} target="_blank" rel="noreferrer"><span>⌖</span>Captured pin</a>{/if}</div>{/if}
+			{@render entryMenu(entry, 'spine-menu')}
+			{@render placeLinks(entry, 'spine-map-actions')}
 		</div>
 	</article>
 {/snippet}
+
+<svelte:window onpopstate={handlePopState} onkeydown={handleKeydown} onfocus={refreshToday} />
+<svelte:document onvisibilitychange={() => { if (document.visibilityState === 'visible') refreshToday(); }} />
 
 <svelte:head>
 	<title>Trace — Personal timeline</title>
@@ -1212,9 +1281,10 @@
 		</header>
 
 		<nav class="trace-tabs" aria-label="Trace sections">
-			<button class:active={activeTab === 'today'} type="button" onclick={showToday}>Today</button>
-			<button class:active={activeTab === 'upcoming'} type="button" onclick={showUpcoming}>Plans{#if actionableEntries.length}<span>{actionableEntries.length}</span>{/if}</button>
-			<button class:active={activeTab === 'insights'} type="button" onclick={showInsights}>Insights</button>
+			<button class:active={activeTab === 'today'} aria-current={activeTab === 'today' ? 'page' : undefined} type="button" onclick={showToday}>Today</button>
+			<button class:active={activeTab === 'upcoming'} aria-current={activeTab === 'upcoming' ? 'page' : undefined} type="button" onclick={showUpcoming}>Plans{#if actionableEntries.length}<span aria-label={`${actionableEntries.length} open`}>{actionableEntries.length}</span>{/if}</button>
+			<button class:active={activeTab === 'timeline'} aria-current={activeTab === 'timeline' ? 'page' : undefined} type="button" onclick={showTimeline}>Archive</button>
+			<button class:active={activeTab === 'insights'} aria-current={activeTab === 'insights' ? 'page' : undefined} type="button" onclick={showInsights}>Insights</button>
 		</nav>
 
 		{#if captureOpen && !draft}
@@ -1287,7 +1357,7 @@
 
 						{#if overdueAttentionEntries.length}
 							<section class="spine-section attention-spine">
-								<header><span>Needs attention</span><small>{overdueAttentionEntries.length}</small></header>
+								<header><span>Needs attention</span><small>{overdueAttentionEntries.length} overdue</small></header>
 								{#each overdueAttentionEntries as entry (entry.id)}{@render spineTrace(entry, 'attention')}{/each}
 							</section>
 						{/if}
@@ -1298,10 +1368,7 @@
 						</section>
 
 						{#if pastEntries.length}
-							<details class="behind-section">
-								<summary><span>Past traces</span><small>{pastEntries.length} {pastEntries.length === 1 ? 'trace' : 'traces'} · back to {formatSpineDate(pastEntries[pastEntries.length - 1])}</small><i aria-hidden="true">＋</i></summary>
-								<div class="behind-content">{#each pastEntries as entry (entry.id)}{@render spineTrace(entry, 'past')}{/each}<button class="open-archive" type="button" onclick={showTimeline}>Open the archive <span>→</span></button></div>
-							</details>
+							<button class="behind-section past-link" type="button" onclick={showTimeline}><span>Past traces</span><small>{pastEntries.length} {pastEntries.length === 1 ? 'trace' : 'traces'} · back to {formatSpineDate(pastEntries[pastEntries.length - 1])}</small><i aria-hidden="true">→</i></button>
 						{/if}
 					</div>
 				{/if}
@@ -1309,7 +1376,7 @@
 				<div class="section-heading"><div><p class="eyebrow">Archive</p><h2>Your full timeline</h2></div><span class="entry-count">{filteredTimeline.length}</span></div>
 				<div class="timeline-tools">
 					<label class="timeline-search"><span aria-hidden="true">⌕</span><input type="search" bind:value={timelineQuery} placeholder="Search people, places, notes…" aria-label="Search your timeline" />{#if timelineQuery}<button type="button" onclick={() => (timelineQuery = '')} aria-label="Clear timeline search">×</button>{/if}</label>
-					<div class="timeline-filters" aria-label="Filter timeline by category"><button class:active={timelineFilter === 'All'} type="button" onclick={() => (timelineFilter = 'All')}>All</button>{#each availableTimelineCategories as category}<button class:active={timelineFilter === category} type="button" onclick={() => (timelineFilter = category)}><i class={`category-dot ${category.toLowerCase()}`}></i>{category}</button>{/each}</div>
+					<div class="timeline-filters" role="group" aria-label="Filter timeline by category"><button class:active={timelineFilter === 'All'} aria-pressed={timelineFilter === 'All'} type="button" onclick={() => (timelineFilter = 'All')}>All</button>{#each availableTimelineCategories as category}<button class:active={timelineFilter === category} aria-pressed={timelineFilter === category} type="button" onclick={() => (timelineFilter = category)}><i class={`category-dot ${category.toLowerCase()}`}></i>{category}</button>{/each}</div>
 				</div>
 				<div class="timeline-groups">
 					{#if loadingEntries}<div class="timeline-empty"><span class="spinner dark"></span><p>Opening your timeline…</p></div>{:else if timeline.length === 0}<div class="timeline-empty"><span>＋</span><strong>Your timeline is ready</strong><p>Your first confirmed capture will appear here.</p></div>{:else if filteredTimeline.length === 0}<div class="timeline-empty"><span>⌕</span><strong>No matching traces</strong><p>Try another word or choose a different category.</p><button type="button" onclick={() => { timelineQuery = ''; timelineFilter = 'All'; }}>Clear filters</button></div>{:else}{#each timelineGroups as group (group.key)}<section class="timeline-day-group"><header><h3>{group.label}</h3><span>{group.entries.length}</span></header><div class="timeline-list">{#each group.entries as entry (entry.id)}{@render traceCard(entry)}{/each}</div></section>{/each}{/if}
@@ -1324,15 +1391,10 @@
 					<span>{actionableEntries.length}</span>
 				</header>
 
-				<div class="connection-banner">
-					<span>G</span>
-					<div><b>Google connection comes later</b><p>Trace is keeping these plans safely on this device until synchronization is enabled.</p></div>
-				</div>
-
 				{#if loadingEntries}
 					<div class="upcoming-empty"><span class="spinner dark"></span><p>Opening your plans…</p></div>
 				{:else if actionableEntries.length === 0}
-					<div class="upcoming-empty"><span>✓</span><h2>Nothing needs your attention</h2><p>Calendar events and reminders will appear here after you confirm them.</p><button type="button" onclick={() => openCapture()}>Capture something</button></div>
+					<div class="upcoming-empty"><span>✓</span><h2>Nothing needs your attention</h2><p>Upcoming events and open reminders will appear here after you confirm them.</p><button type="button" onclick={() => openCapture()}>Capture something</button></div>
 				{:else}
 					<div class="upcoming-groups">
 						{#each upcomingGroups as group (group.key)}
@@ -1341,11 +1403,12 @@
 								<div class="upcoming-list">
 									{#each group.entries as entry (entry.id)}
 										<article class={`upcoming-item ${entry.destination.toLowerCase()}`}>
-											<div class="upcoming-item-top"><span class="upcoming-symbol">{entry.destination === 'Calendar' ? '▦' : '!'}</span><div><div class="upcoming-meta"><span>{entry.destination}</span><i>·</i><span>{entry.category}</span></div><h3>{entry.title}</h3></div></div>
+											<div class="upcoming-item-top"><span class="upcoming-symbol" aria-hidden="true">{entry.destination === 'Calendar' ? '▦' : '!'}</span><div><div class="upcoming-meta"><span>{entry.destination}</span>{#if entry.category !== entry.destination}<i>·</i><span>{entry.category}</span>{/if}</div><h3>{entry.title}</h3></div></div>
 											<p class="upcoming-detail">“{entry.transcript}”</p>
 											<div class="upcoming-facts">
 												<span><i>◷</i>{entry.scheduledDate ? formatScheduledDate(entry.scheduledDate) : 'Date needed'}{entry.scheduledTime ? ` at ${formatClockTime(entry.scheduledTime)}` : ' · All day'}</span>
 												{#if entry.destination === 'Calendar' && entry.durationMinutes}<span><i>↔</i>{entry.durationMinutes} minutes</span>{/if}
+												{#if entry.people?.length}<span><i>☺</i>{entry.people.join(' & ')}</span>{/if}
 											</div>
 											<div class="upcoming-actions">
 												<button type="button" onclick={() => beginEntryEdit(entry)}>{entry.scheduledDate ? 'Reschedule or edit' : 'Add a date'}</button>
@@ -1365,55 +1428,48 @@
 			<section class="insights-screen" aria-labelledby="insights-title">
 				<header class="insights-header">
 					<div><p class="eyebrow">Patterns over time</p><h1 id="insights-title">Insights</h1></div>
-					<span>{insightEntries.length}</span>
+					<span aria-label={`${insights.entries.length} traces in this period`}>{insights.entries.length}</span>
 				</header>
 
-				<div class="range-picker" aria-label="Insight period">
-					<button class:active={insightRange === 7} type="button" onclick={() => (insightRange = 7)}>7 days</button>
-					<button class:active={insightRange === 30} type="button" onclick={() => (insightRange = 30)}>30 days</button>
-					<button class:active={insightRange === 'all'} type="button" onclick={() => (insightRange = 'all')}>All time</button>
+				<div class="range-picker" role="group" aria-label="Insight period">
+					<button class:active={insightRange === 7} aria-pressed={insightRange === 7} type="button" onclick={() => (insightRange = 7)}>7 days</button>
+					<button class:active={insightRange === 30} aria-pressed={insightRange === 30} type="button" onclick={() => (insightRange = 30)}>30 days</button>
+					<button class:active={insightRange === 'all'} aria-pressed={insightRange === 'all'} type="button" onclick={() => (insightRange = 'all')}>All time</button>
 				</div>
 
 				{#if loadingEntries}
 					<div class="insights-empty"><span class="spinner dark"></span><p>Reading your timeline…</p></div>
 				{:else if timeline.length === 0}
 					<div class="insights-empty"><span>⌁</span><h2>Insights start with a trace</h2><p>Capture a few moments and patterns will begin to appear here.</p><button type="button" onclick={() => openCapture()}>Capture something</button></div>
-				{:else if insightEntries.length === 0}
-					<div class="insights-empty"><span>○</span><h2>No entries in this period</h2><p>Choose a longer range to see your earlier captures.</p></div>
+				{:else if insights.entries.length === 0}
+					<div class="insights-empty"><span>○</span><h2>No traces in this period</h2><p>Choose a longer range to see your earlier captures.</p></div>
 				{:else}
-					<div class="insight-overview">
-						<article><p>Captured</p><strong>{insightEntries.length}</strong><small>{insightRangeLabel}</small></article>
-						<article><p>Active days</p><strong>{insightStats.activeDays}</strong><small>Days with at least one entry</small></article>
-					</div>
-
-					<section class="weekly-story-card">
-						<div class="insight-heading"><div><p class="eyebrow">Your week in words</p><h2>What Trace is noticing</h2></div><span>Last 7 days</span></div>
-						<div>{#each weeklyStories as story, index}<p><span>{index + 1}</span>{story}</p>{/each}</div>
+					<section class="weekly-story-card" aria-label={`Summary, ${insightRangeLabel.toLocaleLowerCase()}`}>
+						<div>{#each insights.stories as story}<p>{story}</p>{/each}</div>
 					</section>
 
-					<section class="activity-card">
-						<div class="insight-heading"><div><p class="eyebrow">Rhythm</p><h2>Last 7 days</h2></div><span>{lastSevenDays.reduce((total, item) => total + item.count, 0)} entries</span></div>
-						<div class="activity-chart" aria-label="Entries captured during the last seven days">
-							{#each lastSevenDays as item}
-								<div><span>{item.count || ''}</span><i style:height={`${Math.max(7, (item.count / maxDailyEntries) * 82)}px`}></i><small>{item.label}</small></div>
-							{/each}
+					<section class="signals-section" aria-label="Signals">
+						<div class="signal-grid">
+							<article class="signal-wellbeing"><p>Wellbeing</p><strong>{insights.averageWellbeing === null ? '—' : `${insights.averageWellbeing.toFixed(1)} / 10`}</strong><small>{insights.wellbeingCount} scored {insights.wellbeingCount === 1 ? 'check-in' : 'check-ins'}</small></article>
+							<article class="signal-habit"><p>Activity</p><strong>{insights.activityMinutes ? `${insights.activityMinutes} min` : insights.activityCount}</strong><small>{insights.activityCount} {insights.activityCount === 1 ? 'session' : 'sessions'} done</small></article>
+							<article class="signal-reminder"><p>Reminders</p><strong>{insights.remindersDone} / {insights.reminderCount}</strong><small>done</small></article>
 						</div>
 					</section>
 
-					<section class="signals-section">
-						<div class="insight-heading"><div><p class="eyebrow">Signals</p><h2>What you’ve logged</h2></div></div>
-						<div class="signal-grid">
-							<article class="signal-wellbeing"><span>◎</span><p>Wellbeing</p><strong>{insightStats.averageWellbeing === null ? 'No data' : `${insightStats.averageWellbeing.toFixed(1)} / 10`}</strong><small>{insightStats.wellbeingCount} {insightStats.wellbeingCount === 1 ? 'check-in' : 'check-ins'}</small></article>
-							<article class="signal-habit"><span>↗</span><p>Exercise</p><strong>{insightStats.habitMinutes ? `${insightStats.habitMinutes} min` : `${insightStats.habitCount} sessions`}</strong><small>{insightStats.habitCount} {insightStats.habitCount === 1 ? 'session' : 'sessions'} logged</small></article>
-							<article class="signal-reminder"><span>!</span><p>Reminders</p><strong>{insightStats.reminderCount}</strong><small>Created in this period</small></article>
+					<section class="activity-card">
+						<div class="insight-heading"><div><p class="eyebrow">Rhythm</p><h2>Traces per {insightRange === 'all' ? 'week' : 'day'}</h2></div><span>{insightRangeLabel}</span></div>
+						<div class="activity-chart" style:--bars={insights.bars.length} role="img" aria-label={`Traces per ${insightRange === 'all' ? 'week' : 'day'}, ${insightRangeLabel.toLocaleLowerCase()}`}>
+							{#each insights.bars as bar (bar.key)}
+								<div class:current={bar.current}><span>{insights.bars.length <= 7 && bar.count ? bar.count : ''}</span><i style:height={`${bar.count ? Math.max(6, (bar.count / maxInsightBar) * 82) : 3}px`}></i><small>{bar.label}</small></div>
+							{/each}
 						</div>
 					</section>
 
 					<section class="category-card">
 						<div class="insight-heading"><div><p class="eyebrow">Composition</p><h2>Your traces</h2></div><span>{insightRangeLabel}</span></div>
 						<div class="category-bars">
-							{#each insightStats.categoryCounts.filter((item) => item.count > 0) as item}
-								<div><div><span><i class={`category-dot ${item.category.toLowerCase()}`}></i>{item.category}</span><b>{item.count} · {item.percentage}%</b></div><progress value={item.count} max={insightEntries.length}>{item.percentage}%</progress></div>
+							{#each insights.categoryCounts.filter((item) => item.count > 0) as item}
+								<div><div><span><i class={`category-dot ${item.category.toLowerCase()}`}></i>{item.category}</span><b>{item.count} · {item.percentage}%</b></div><progress value={item.count} max={insights.entries.length}>{item.percentage}%</progress></div>
 							{/each}
 						</div>
 					</section>
@@ -1429,7 +1485,7 @@
 				<div class="data-tools-sheet" role="dialog" aria-modal="true" aria-labelledby="data-tools-title">
 					<div class="sheet-handle"></div>
 					<div class="sheet-heading"><div><span class="data-tools-symbol">↧</span><div><p>Device-local storage</p><h2 id="data-tools-title">Your Trace data</h2></div></div><button type="button" onclick={() => (showDataTools = false)} aria-label="Close data tools">×</button></div>
-					<div class="data-summary"><article><span>Entries</span><strong>{timeline.length}</strong></article><article><span>Storage</span><strong>This device</strong></article></div>
+					<div class="data-summary"><article><span>Entries</span><strong>{timeline.length}</strong></article><article><span>Storage</span><strong>This device</strong>{#if storagePersisted !== null}<small>{storagePersisted ? 'Protected from automatic clean-up' : 'Chrome may clear it if space runs low'}</small>{/if}</article></div>
 					<div class="backup-status"><span class:ready={Boolean(lastBackupAt)}>{lastBackupAt ? '✓' : '!'}</span><div><b>{formatLastBackup()}</b><small>A backup protects your timeline if Chrome’s site data is cleared.</small></div></div>
 					<div class="data-actions">
 						<button type="button" onclick={exportBackup}><span>↓</span><div><b>Export backup</b><small>Download every entry as a Trace JSON file</small></div></button>
@@ -1447,8 +1503,8 @@
 			<div class="sheet-backdrop" role="presentation">
 				<div class="edit-entry-sheet" role="dialog" aria-modal="true" aria-labelledby="edit-entry-title">
 					<div class="sheet-handle"></div>
-					<div class="sheet-heading"><div><span class={`edit-category-symbol ${editingEntry.category.toLowerCase()}`}>✎</span><div><p>Timeline entry</p><h2 id="edit-entry-title">Edit your trace</h2></div></div><button type="button" onclick={() => (editingEntry = null)} aria-label="Close entry editor">×</button></div>
-					<form class="entry-edit-form" onsubmit={saveEditedEntry}>
+					<div class="sheet-heading"><div><span class={`edit-category-symbol ${editingEntry.category.toLowerCase()}`}>✎</span><div><p>Timeline entry</p><h2 id="edit-entry-title">Edit your trace</h2></div></div><button type="button" onclick={closeEntryEditor} aria-label="Close entry editor">×</button></div>
+					<form class="entry-edit-form" onsubmit={saveEditedEntry} novalidate>
 						<section class="capture-rewrite">
 							<label for="edit-capture">Replace the full capture</label>
 							<textarea id="edit-capture" rows="3" bind:value={editingEntry.transcript} placeholder="Rewrite what happened or what you are planning"></textarea>
@@ -1459,14 +1515,15 @@
 							<label>Category<select bind:value={editingEntry.category}>{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select></label>
 							<label>Title<input bind:value={editingEntry.title} required /></label>
 							<label class="wide">Details<input bind:value={editingEntry.detail} required /></label>
+							{#if editingEntry.category === 'Wellbeing'}
+								<label>Score<select bind:value={editingScore}><option value="">No score</option>{#each wellbeingScores as score}<option value={String(score)}>{score} / 10</option>{/each}</select></label>
+							{/if}
 							{#if editingEntry.category === 'Place'}
 								<label class="wide">Address or area<input bind:value={editingEntry.placeAddress} placeholder="Optional, e.g. Vesterbro, Copenhagen" /></label>
 							{/if}
 							<label>Destination<select bind:value={editingEntry.destination}>{#each destinations as destination}<option value={destination}>{destination}</option>{/each}</select></label>
-							{#if editingEntry.destination !== 'Timeline'}
-								<label>Scheduled date<input type="date" bind:value={editingEntry.scheduledDate} required /></label>
-								<label>Scheduled time<input type="time" bind:value={editingEntry.scheduledTime} /></label>
-							{/if}
+							<label>{editingEntry.destination === 'Timeline' ? 'Date' : 'Scheduled date'}<input type="date" bind:value={editingEntry.scheduledDate} required={editingEntry.destination !== 'Timeline'} /></label>
+							<label>Time<input type="time" bind:value={editingEntry.scheduledTime} /></label>
 							{#if editingEntry.destination === 'Calendar'}
 								<label>Duration<select bind:value={editingEntry.durationMinutes}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={90}>1½ hours</option><option value={120}>2 hours</option><option value={180}>3 hours</option></select></label>
 							{/if}
@@ -1477,6 +1534,7 @@
 								<label class="wide">Status<select bind:value={editingEntry.status}><option value="Planned">Planned</option><option value="Tentative">Tentative</option><option value="Completed">Completed</option></select></label>
 							{/if}
 						</div>
+						{#if editingEntry.destination === 'Timeline'}<p class="field-hint">Leave the date empty to keep the day it was captured.</p>{/if}
 						{#if editingEntry.category === 'Place'}
 							<section class:attached={editingEntry.latitude !== undefined && editingEntry.longitude !== undefined} class="edit-place-location">
 								<div><span>⌖</span><div><b>{editingEntry.latitude !== undefined && editingEntry.longitude !== undefined ? 'Location attached' : 'No precise location attached'}</b><small>{editingEntry.latitude !== undefined && editingEntry.longitude !== undefined ? `${editingEntry.latitude}, ${editingEntry.longitude}${editingEntry.locationAccuracy ? ` · about ${editingEntry.locationAccuracy} m` : ''}` : 'Attach where you are now, or rely on the name and address.'}</small></div></div>
@@ -1484,9 +1542,10 @@
 								{#if placeLocationMessage}<p class:error={placeLocationState === 'error'}>{placeLocationMessage}</p>{/if}
 							</section>
 						{/if}
-					{#if editingEntry.destination !== 'Timeline'}<p class="edit-route-note"><span>○</span>Saved only in Trace. Google connection is not enabled yet.</p>{/if}
+						{#if editingEntry.destination !== 'Timeline'}<p class="edit-route-note"><span>○</span>Saved only in Trace. Google connection is not enabled yet.</p>{/if}
 						<p class="edit-captured-at">Originally captured {formatDateTime24(editingEntry.capturedAt)}</p>
-						<div class="sheet-actions"><button type="button" onclick={() => (editingEntry = null)}>Cancel</button><button class="confirm" type="submit">Save changes</button></div>
+						{#if editError}<p class="draft-save-error" role="alert"><span>!</span>{editError}</p>{/if}
+						<div class="sheet-actions"><button type="button" onclick={closeEntryEditor}>Cancel</button><button class="confirm" type="submit">Save changes</button></div>
 					</form>
 				</div>
 			</div>
@@ -1496,21 +1555,31 @@
 			<div class="sheet-backdrop" role="presentation">
 				<div class="confirm-sheet" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
 					<div class="sheet-handle"></div>
-					<div class="sheet-heading"><div><span class="success-ring">✓</span><div><p>Here’s what I heard</p><h2 id="confirm-title">{draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length} entries` : 'Confirm your entry'}</h2></div></div><button type="button" onclick={() => { draft = null; editing = false; showDraftDetails = false; draftSaveError = ''; }} aria-label="Close confirmation">×</button></div>
+					<div class="sheet-heading"><div><span class="success-ring">✓</span><div><p>Here’s what I heard</p><h2 id="confirm-title">{draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length} entries` : 'Confirm your entry'}</h2></div></div><button type="button" onclick={dismissDraft} aria-label="Back to capture">×</button></div>
 					<blockquote>“{draft.transcript}”</blockquote>
 					<div class="interpreted-card">
-						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select><span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
+						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select>{#if draft.destination !== 'Timeline'}<span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{/if}{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
 						{#if showDraftDetails && draft.classificationReason}<p class="classification-reason"><span>⌁</span>{draft.classificationReason} · {draft.classificationConfidence || 'Low'} confidence</p>{/if}
 						{#if editing}
 							<div class="edit-fields"><label>Title<input bind:value={draft.title} /></label><label>Detail<input bind:value={draft.detail} /></label></div>
 						{:else}
-							<div class="entry-summary"><strong>{draft.title}</strong>{#if draft.category === 'Social'}<div class="event-facts"><div><span>People</span><b>{draft.people?.join(' & ') || 'Not specified'}</b></div><div><span>Date</span><b>{draft.when}</b></div><div><span>Time</span><b>{draft.scheduledTime ? formatClockTime(draft.scheduledTime) : 'Not specified'}</b></div></div>{:else}<p>{draft.detail}</p><span>{draft.when}</span>{/if}</div>
+							<div class="entry-summary">
+								<strong>{draft.title}</strong>
+								<div class="event-facts">
+									<div><span>When</span><b>{draftWhen}{#if draft.scheduledTimeAssumed && !draft.scheduledTimeAlternative}<em class="guess-tag">approx.</em>{/if}</b>{#if draft.scheduledTimeAssumed && draft.scheduledTimeAlternative}<button class="time-swap" type="button" onclick={useAlternativeTime} aria-label={`Change the time to ${draft.scheduledTimeAlternative}`}>or {draft.scheduledTimeAlternative}?</button>{/if}</div>
+									{#if draft.category === 'Social'}<div><span>People</span><b>{draft.people?.join(' & ') || 'Not specified'}</b></div>{/if}
+									{#if draft.category !== 'Social' && draft.category !== 'Wellbeing' && !fillerDetails.has(draft.detail)}<div><span>Detail</span><b>{draft.detail}</b></div>{/if}
+								</div>
+								{#if draft.category === 'Wellbeing'}
+									<div class="score-picker" role="group" aria-label="Score from 0 to 10, optional"><p><b>Score</b><small>{draft.wellbeingScore === undefined ? 'Optional · tap to add' : 'Tap again to clear'}</small></p><div>{#each wellbeingScores as score}<button type="button" class:selected={draft.wellbeingScore === score} aria-pressed={draft.wellbeingScore === score} onclick={() => setDraftScore(score)}>{score}</button>{/each}</div></div>
+								{/if}
+							</div>
 						{/if}
 					</div>
 
 					{#if draft.scheduledDates && draft.scheduledDates.length > 1}
-						<section class="multi-date-card" aria-label="Inferred upcoming dates">
-							<div class="multi-date-heading"><span>▦</span><div><p>Multiple dates understood</p><h3>{draft.scheduledDates.length} upcoming dates</h3><small>Each date will become its own independently editable trace.</small></div></div>
+						<section class="multi-date-card" aria-label="Inferred dates">
+							<div class="multi-date-heading"><span>▦</span><div><p>Multiple dates understood</p><h3>{draft.scheduledDates.length} dates</h3><small>Each date becomes its own trace that you can edit on its own.</small></div></div>
 							<div class="multi-date-list">
 								{#each draft.scheduledDates as date, index (`${date}-${index}`)}
 									<div><span>{index + 1}</span><label><small>{formatScheduledDate(date)}</small><input type="date" value={date} onchange={(event) => updateDraftOccurrence(index, event.currentTarget.value)} /></label><button type="button" onclick={() => removeDraftOccurrence(index)} aria-label={`Remove ${formatScheduledDate(date)}`}>×</button></div>
@@ -1530,7 +1599,7 @@
 						</section>
 					{/if}
 
-					<button class="confirmation-detail-toggle" type="button" aria-expanded={showDraftDetails} onclick={() => (showDraftDetails = !showDraftDetails)}><span>{showDraftDetails ? '−' : '+'}</span><div><b>{showDraftDetails ? 'Hide details' : draft.category === 'Place' ? 'Add location or review details' : 'Review routing and details'}</b><small>{draft.destination}{draft.scheduledDates && draft.scheduledDates.length > 1 ? ` · ${draft.scheduledDates.length} dates` : draft.scheduledDate ? ` · ${formatScheduledDate(draft.scheduledDate)}` : ''}</small></div><i aria-hidden="true">{showDraftDetails ? '⌃' : '⌄'}</i></button>
+					<button class="confirmation-detail-toggle" type="button" aria-expanded={showDraftDetails} onclick={() => (showDraftDetails = !showDraftDetails)}><span>{showDraftDetails ? '−' : '+'}</span><div><b>{showDraftDetails ? 'Hide details' : draft.category === 'Place' ? 'Add location, date or destination' : 'Change date, time or destination'}</b><small>{draft.destination} · {draftWhen}</small></div><i aria-hidden="true">{showDraftDetails ? '⌃' : '⌄'}</i></button>
 
 					{#if showDraftDetails && draft.category === 'Place'}
 						<section class:attached={draft.latitude !== undefined && draft.longitude !== undefined} class="place-handoff-card">
@@ -1547,23 +1616,21 @@
 
 					{#if showDraftDetails}<div class="routing-card">
 						<div class="routing-heading"><div><b>Where should this go?</b><small>Trace inferred an action separately from its category.</small></div><span class={`route-confidence ${(draft.destinationConfidence || 'low').toLowerCase().replace(' ', '-')}`}>{draft.destinationConfidence === 'User selected' ? 'Your choice' : `${draft.destinationConfidence || 'Low'} confidence`}</span></div>
-						<div class="destination-picker" aria-label="Entry destination">
+						<div class="destination-picker" role="group" aria-label="Entry destination">
 							<button class:selected={draft.destination === 'Timeline'} type="button" aria-pressed={draft.destination === 'Timeline'} onclick={() => setDraftDestination('Timeline')}><span>≋</span><b>Timeline</b><small>Keep in Trace</small></button>
 							<button class:selected={draft.destination === 'Calendar'} type="button" aria-pressed={draft.destination === 'Calendar'} onclick={() => setDraftDestination('Calendar')}><span>▦</span><b>Calendar</b><small>Plan an event</small></button>
 							<button class:selected={draft.destination === 'Reminder'} type="button" aria-pressed={draft.destination === 'Reminder'} onclick={() => setDraftDestination('Reminder')}><span>!</span><b>Reminder</b><small>Prompt me later</small></button>
 						</div>
 						{#if draft.destinationReason}<p class="routing-reason"><span>⌁</span>{draft.destinationReason}</p>{/if}
 
-						{#if draft.destination !== 'Timeline'}
-							<div class="schedule-fields">
-								{#if draft.scheduledDates && draft.scheduledDates.length > 1}<div class="multi-date-field"><small>Dates</small><b>{draft.scheduledDates.length} inferred above</b></div>{:else}<label>Date<input type="date" bind:value={draft.scheduledDate} required /></label>{/if}
-								<label>Time <small>{draft.destination === 'Calendar' ? 'optional for all-day' : 'optional for date-only'}</small><input type="time" bind:value={draft.scheduledTime} onchange={() => { draftTimeConfirmed = true; updateDraftProvider(); }} /></label>
-								{#if draft.destination === 'Calendar'}
-									<label>Duration<select bind:value={draft.durationMinutes}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={90}>1½ hours</option><option value={120}>2 hours</option><option value={180}>3 hours</option></select></label>
-								{/if}
-							</div>
-							<div class="google-route-note"><span>○</span><div><b>Saved in Trace only</b><small>Nothing will be sent to Google until you choose to connect it later.</small></div></div>
-						{/if}
+						<div class="schedule-fields">
+							{#if draft.scheduledDates && draft.scheduledDates.length > 1}<div class="multi-date-field"><small>Dates</small><b>{draft.scheduledDates.length} listed above</b></div>{:else}<label>Date <small>{draft.destination === 'Timeline' ? 'empty = today' : 'required'}</small><input type="date" bind:value={draft.scheduledDate} required={draft.destination !== 'Timeline'} onchange={() => (draftSaveError = '')} /></label>{/if}
+							<label>Time <small>{draft.destination === 'Calendar' ? 'empty = all day' : 'optional'}</small><input type="time" bind:value={draft.scheduledTime} onchange={(event) => setDraftTime(event.currentTarget.value)} /></label>
+							{#if draft.destination === 'Calendar'}
+								<label>Duration<select bind:value={draft.durationMinutes}><option value={30}>30 minutes</option><option value={60}>1 hour</option><option value={90}>1½ hours</option><option value={120}>2 hours</option><option value={180}>3 hours</option></select></label>
+							{/if}
+						</div>
+						{#if draft.destination !== 'Timeline'}<div class="google-route-note"><span>○</span><div><b>Saved in Trace only</b><small>Nothing will be sent to Google until you choose to connect it later.</small></div></div>{/if}
 					</div>
 					{/if}
 					{#if draftSaveError}<p class="draft-save-error" role="alert"><span>!</span>{draftSaveError}</p>{/if}
