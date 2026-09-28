@@ -1,3 +1,5 @@
+import { addDays, describeSchedule, localDateKey } from './dates';
+
 export type EntryCategory = 'Wellbeing' | 'Reminder' | 'Habit' | 'Place' | 'Social' | 'Note';
 export type EntryStatus = 'Planned' | 'Completed' | 'Tentative';
 export type ClassificationConfidence = 'High' | 'Medium' | 'Low' | 'User selected';
@@ -24,6 +26,14 @@ export type EntryDraft = {
 	scheduledDate?: string;
 	scheduledDates?: string[];
 	scheduledTime?: string;
+	/** The clock time was inferred ("at 7", "tonight") rather than stated unambiguously. */
+	scheduledTimeAssumed?: boolean;
+	/** The other reading of an ambiguous 12-hour time, e.g. "07:00" when "19:00" was assumed. */
+	scheduledTimeAlternative?: string;
+	/** A 0–10 score, only when the user actually said one. */
+	wellbeingScore?: number;
+	/** Minutes of activity the user described, logged or planned. */
+	activityMinutes?: number;
 	durationMinutes?: number;
 	reminderMinutes?: number;
 	seriesId?: string;
@@ -47,6 +57,10 @@ export type TimelineEntry = EntryDraft & {
 	time: string;
 	capturedAt: string;
 };
+
+const alternation = (values: string[]) => [...values].sort((left, right) => right.length - left.length).join('|');
+const blank = (match: string) => ' '.repeat(match.length);
+const capitalize = (value: string) => (value ? value[0].toLocaleUpperCase('da-DK') + value.slice(1) : value);
 
 const MONTH_NAMES = [
 	'january',
@@ -77,7 +91,7 @@ const DANISH_MONTH_NAMES = [
 	'december'
 ];
 const MONTH_ALIASES = MONTH_NAMES.flatMap((month, index) => [month, DANISH_MONTH_NAMES[index]]);
-const MONTHS = [...new Set(MONTH_ALIASES)].join('|');
+const MONTHS = alternation([...new Set(MONTH_ALIASES)]);
 const MONTH_INDEX = new Map(MONTH_ALIASES.map((month, index) => [month, Math.floor(index / 2)]));
 const WEEKDAY_ALIASES = [
 	['sunday', 'søndag', 'sondag'],
@@ -88,66 +102,96 @@ const WEEKDAY_ALIASES = [
 	['friday', 'fredag'],
 	['saturday', 'lørdag', 'lordag']
 ];
-const WEEKDAYS = WEEKDAY_ALIASES.flat();
-const WEEKDAY_PATTERN = WEEKDAYS.join('|');
-const NUMBER_WORDS: Record<string, number> = {
+const WEEKDAY_PATTERN = alternation(WEEKDAY_ALIASES.flat());
+
+const EN_NUMBER_WORDS: Record<string, number> = {
 	zero: 0,
-	nul: 0,
 	one: 1,
-	a: 1,
-	an: 1,
+	two: 2,
+	three: 3,
+	four: 4,
+	five: 5,
+	six: 6,
+	seven: 7,
+	eight: 8,
+	nine: 9,
+	ten: 10,
+	eleven: 11,
+	twelve: 12,
+	thirteen: 13,
+	fourteen: 14,
+	fifteen: 15,
+	sixteen: 16,
+	seventeen: 17,
+	eighteen: 18,
+	nineteen: 19,
+	twenty: 20,
+	thirty: 30,
+	forty: 40,
+	fifty: 50
+};
+const DA_NUMBER_WORDS: Record<string, number> = {
+	nul: 0,
 	en: 1,
 	et: 1,
-	two: 2,
 	to: 2,
-	three: 3,
 	tre: 3,
-	four: 4,
 	fire: 4,
-	five: 5,
 	fem: 5,
-	six: 6,
 	seks: 6,
-	seven: 7,
 	syv: 7,
-	eight: 8,
 	otte: 8,
-	nine: 9,
 	ni: 9,
-	ten: 10,
 	ti: 10,
-	eleven: 11,
 	elleve: 11,
-	twelve: 12,
 	tolv: 12,
-	thirteen: 13,
 	tretten: 13,
-	fourteen: 14,
 	fjorten: 14,
-	fifteen: 15,
 	femten: 15,
-	sixteen: 16,
 	seksten: 16,
-	seventeen: 17,
 	sytten: 17,
-	eighteen: 18,
 	atten: 18,
-	nineteen: 19,
 	nitten: 19,
-	twenty: 20,
 	tyve: 20,
-	thirty: 30,
 	tredive: 30,
-	forty: 40,
 	fyrre: 40,
-	fifty: 50,
 	halvtreds: 50
 };
-const NUMBER_TOKEN = `(?:\\d+(?:[.,]\\d+)?|${Object.keys(NUMBER_WORDS).join('|')})`;
-const REMINDER_PATTERN = /\b(remind me|remember to|don['’]?t forget|set (?:a |an )?reminder|mind mig om(?: at)?|husk at|glem ikke at|lav (?:en )?påmindelse)\b/i;
+// "a week" and "an hour" are amounts. "Look at a house" is not a clock time, so articles never count as hours.
+const NUMBER_WORDS: Record<string, number> = { ...EN_NUMBER_WORDS, ...DA_NUMBER_WORDS, a: 1, an: 1 };
+const NUMBER_TOKEN = `(?:\\d+(?:[.,]\\d+)?|${alternation(Object.keys(NUMBER_WORDS))})`;
+const EN_HOUR_TOKEN = `(?:\\d{1,2}|${alternation(Object.keys(EN_NUMBER_WORDS))})`;
+const DA_HOUR_TOKEN = `(?:\\d{1,2}|${alternation(Object.keys(DA_NUMBER_WORDS))})`;
+const EN_MINUTE_WORDS: Record<string, number> = { "o'clock": 0, fifteen: 15, thirty: 30, 'forty five': 45, 'forty-five': 45 };
+
+const REMINDER_PATTERN =
+	/\b(remind me|remember to|don['’]?t forget|set (?:a |an )?reminder|mind mig om(?: at)?|husk at|glem ikke at|lav (?:en )?påmindelse|husk)\b/i;
+const SCORE_SOURCE = `(?<![\\p{L}\\d.,])(${NUMBER_TOKEN})\\s*(?:\\/\\s*(?:10|ti|ten)|(?:out of|ud af|af)\\s+(?:10|ti|ten))(?![\\p{L}\\d])`;
+const SCORE_PATTERN = new RegExp(SCORE_SOURCE, 'iu');
+// Decimals followed by a unit are measurements ("1.5 hours"), never dates or clock times.
+const MEASUREMENT_PATTERN =
+	/\d+[.,]\d+\s*(?:hours?|hrs?|h|timer?|minutes?|mins?|minutter?|min|km|kilometers?|kilometer|miles?|kg|k|l|liters?|litres?|%)(?![\p{L}])/giu;
+const MARKED_CLOCK_PATTERN = /\b(?:kl\.?|klokken|at)\s*\d{1,2}[.:]\d{2}\b/gi;
+
+type Tense = 'past' | 'future' | 'neutral';
+
+const STRONG_PAST = new RegExp(
+	`\\b(?:yesterday|i går|i forgårs|ago|siden|this morning|i morges|last\\s+(?:week|night|${WEEKDAY_PATTERN})|sidste\\s+(?:uge|${WEEKDAY_PATTERN})|i\\s+(?:${WEEKDAY_PATTERN})s)\\b`,
+	'i'
+);
+const FUTURE_CUE = new RegExp(
+	`\\b(?:tomorrow|i morgen|i overmorgen|tonight|i aften|next|næste|will|going to|gonna|plan|planning|shall|skal|vil|kommende|upcoming|på\\s+(?:${WEEKDAY_PATTERN}))\\b`,
+	'i'
+);
+const PAST_VERB =
+	/\b(?:went|had|was|were|did|finished|completed|trained|ran|cycled|swam|walked|hiked|meditated|worked out|exercised|slept|felt|earlier|gik|havde|var|gjorde|afsluttede|trænede|løb|cyklede|svømmede|vandrede|mediterede|motionerede|sov|følte|tidligere)\b/i;
+
+const MORNING_CONTEXT = /\b(?:morning|breakfast|morgenmad|formiddag|om morgenen|i morgen tidlig|tidlig)\b/i;
+const EVENING_CONTEXT =
+	/\b(?:evening|tonight|dinner|supper|drinks?|party|concert|date night|bar|cinema|movie|theatre|aften|aftenen|middag|aftensmad|fest|koncert|bytur|biograf|teater)\b/i;
 
 function numberFrom(value: string) {
-	const normalized = value.toLocaleLowerCase('da-DK').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+	const normalized = value.toLocaleLowerCase('da-DK');
 	return NUMBER_WORDS[normalized] ?? Number(normalized.replace(',', '.'));
 }
 
@@ -156,147 +200,218 @@ function weekdayIndex(value: string) {
 	return WEEKDAY_ALIASES.findIndex((aliases) => aliases.includes(normalized));
 }
 
-function extractWeekdayDates(text: string, today = new Date()) {
-	const start = new Date(today);
-	start.setHours(0, 0, 0, 0);
-	const matches = [...text.matchAll(new RegExp(`\\b(?:(next|næste)\\s+)?(${WEEKDAY_PATTERN})\\b`, 'gi'))];
-	if (!matches.length) return [];
-	const appliesToNextWeek = /\b(?:next week|næste uge)\b/i.test(text);
-	const nextWeekMonday = new Date(start);
-	if (appliesToNextWeek) {
-		const daysUntilMonday = ((8 - start.getDay()) % 7) || 7;
-		nextWeekMonday.setDate(start.getDate() + daysUntilMonday);
-	}
-	const dates = matches
-		.map((match) => {
-			const target = weekdayIndex(match[2]);
-			if (appliesToNextWeek) {
-				const date = new Date(nextWeekMonday);
-				const daysAfterMonday = (target + 6) % 7;
-				date.setDate(nextWeekMonday.getDate() + daysAfterMonday);
-				return localDateKey(date);
-			}
-			let daysAhead = (target - start.getDay() + 7) % 7;
-			if (daysAhead === 0 || match[1]) daysAhead += 7;
-			const date = new Date(start);
-			date.setDate(date.getDate() + daysAhead);
-			return localDateKey(date);
-		})
-		.filter((date, index, all) => all.indexOf(date) === index)
-		.sort();
-	return dates;
+function tenseOf(text: string): Tense {
+	if (REMINDER_PATTERN.test(text)) return 'future';
+	if (STRONG_PAST.test(text)) return 'past';
+	if (FUTURE_CUE.test(text)) return 'future';
+	if (PAST_VERB.test(text)) return 'past';
+	return 'neutral';
 }
 
-function explicitDateParts(text: string) {
-	const monthFirst = text.match(
-		new RegExp(`\\b(${MONTHS})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\.?(?:,?\\s+(\\d{4}))?`, 'i')
-	);
+type DateReading = { date?: string; dates?: string[]; tokenIndex?: number; tokenLength?: number };
+
+function resolveWeekdays(text: string, today: Date, tense: Tense) {
+	const matches = [
+		...text.matchAll(new RegExp(`\\b(?:(next|næste|last|sidste|this|denne|on|på|i)\\s+)?(${WEEKDAY_PATTERN})(s)?\\b`, 'gi'))
+	];
+	if (!matches.length) return [];
+	const todayIndex = today.getDay();
+	const nextWeek = /\b(?:next week|næste uge)\b/i.test(text);
+	const lastWeek = /\b(?:last week|sidste uge)\b/i.test(text);
+	const dates = matches.map((match) => {
+		const prefix = match[1]?.toLocaleLowerCase('da-DK');
+		const target = weekdayIndex(match[2]);
+		const explicitPast = prefix === 'last' || prefix === 'sidste' || (prefix === 'i' && Boolean(match[3]));
+		const explicitFuture = prefix === 'next' || prefix === 'næste' || prefix === 'på';
+		if (lastWeek || explicitPast || (!explicitFuture && !nextWeek && tense === 'past')) {
+			if (lastWeek) {
+				const previousMonday = -((todayIndex + 6) % 7) - 7;
+				return localDateKey(addDays(today, previousMonday + ((target + 6) % 7)));
+			}
+			let daysBack = (todayIndex - target + 7) % 7;
+			if (daysBack === 0 && explicitPast) daysBack = 7;
+			return localDateKey(addDays(today, -daysBack));
+		}
+		// "Next Monday" and "næste mandag" mean the Monday of next calendar week, like "next week: Monday".
+		if (nextWeek || prefix === 'next' || prefix === 'næste') {
+			const nextMonday = ((8 - todayIndex) % 7) || 7;
+			return localDateKey(addDays(today, nextMonday + ((target + 6) % 7)));
+		}
+		const daysAhead = (target - todayIndex + 7) % 7 || 7;
+		return localDateKey(addDays(today, daysAhead));
+	});
+	return [...new Set(dates)].sort();
+}
+
+function explicitDate(text: string, today: Date, tense: Tense): DateReading | null {
+	const monthFirst = text.match(new RegExp(`\\b(${MONTHS})\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b\\.?(?:,?\\s+(\\d{4}))?`, 'i'));
 	const dayFirst = text.match(
-		new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\.?(?:\\s+of)?\\s+(${MONTHS})(?:,?\\s+(\\d{4}))?`, 'i')
+		new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?\\.?(?:\\s+of)?\\s+(${MONTHS})\\b(?:,?\\s+(\\d{4}))?`, 'i')
 	);
-	const numeric = text.match(/(?:^|\s)(\d{1,2})[/.\-](\d{1,2})(?:[/.\-](\d{2}|\d{4}))?(?=\s|[,.!?]|$)/);
-	if (!monthFirst && !dayFirst && !numeric) return null;
-	if (numeric) {
-		let year = numeric[3] ? Number(numeric[3]) : undefined;
-		if (year !== undefined && year < 100) year += 2000;
-		return { day: Number(numeric[1]), month: Number(numeric[2]) - 1, year };
+	const numeric = text.match(/(?:^|\s)(den\s+|d\.\s*)?(\d{1,2})([/.-])(\d{1,2})(?:\3(\d{4}|\d{2}))?(\.)?(?=\s|[,!?]|$)/i);
+	let parts: { day: number; month: number; year?: number; index: number; length: number } | null = null;
+	const named = monthFirst || dayFirst;
+	if (named) {
+		const monthName = (monthFirst ? monthFirst[1] : dayFirst![2]).toLocaleLowerCase('da-DK');
+		parts = {
+			day: Number(monthFirst ? monthFirst[2] : dayFirst![1]),
+			month: MONTH_INDEX.get(monthName) ?? -1,
+			year: Number(monthFirst ? monthFirst[3] : dayFirst![3]) || undefined,
+			index: named.index ?? 0,
+			length: named[0].length
+		};
+	} else if (numeric) {
+		const [, marker, day, separator, month, year, trailingDot] = numeric;
+		// "10.05" on its own is a Danish clock time. It only counts as a date with a year, a trailing dot,
+		// "den"/"d.", a single-digit month ("10.5"), or a slash or dash.
+		const readsAsClock = separator === '.' && month.length === 2 && !marker && !year && !trailingDot;
+		if (!readsAsClock) {
+			let parsedYear = year ? Number(year) : undefined;
+			if (parsedYear !== undefined && parsedYear < 100) parsedYear += 2000;
+			parts = { day: Number(day), month: Number(month) - 1, year: parsedYear, index: numeric.index ?? 0, length: numeric[0].length };
+		}
 	}
-	const monthName = (monthFirst?.[1] || dayFirst?.[2] || '').toLocaleLowerCase('da-DK');
+	if (!parts || parts.month < 0 || parts.month > 11 || parts.day < 1 || parts.day > 31) return null;
+	const build = (year: number) => new Date(year, parts.month, parts.day, 12);
+	let date = build(parts.year ?? today.getFullYear());
+	if (date.getMonth() !== parts.month) return null;
+	if (!parts.year) {
+		const todayKey = localDateKey(today);
+		if (tense !== 'past' && localDateKey(date) < todayKey) date = build(date.getFullYear() + 1);
+		else if (tense === 'past' && localDateKey(date) > todayKey) date = build(date.getFullYear() - 1);
+	}
+	return { date: localDateKey(date), tokenIndex: parts.index, tokenLength: parts.length };
+}
+
+function extractDates(text: string, today: Date, tense: Tense): DateReading {
+	const after = (days: number) => ({ date: localDateKey(addDays(today, days)) });
+	if (/\b(?:day after tomorrow|i overmorgen)\b/i.test(text)) return after(2);
+	if (/\b(?:tomorrow|i morgen)\b/i.test(text)) return after(1);
+	if (/\b(?:day before yesterday|i forgårs)\b/i.test(text)) return after(-2);
+	if (/\b(?:yesterday|i går)\b/i.test(text)) return after(-1);
+	if (/\b(?:today|i dag|tonight|this (?:morning|afternoon|evening)|i aften|i eftermiddag|i formiddag|i morges)\b/i.test(text)) {
+		return after(0);
+	}
+	const unitDays = (amount: string, unit: string) => Math.round(numberFrom(amount) * (/^(?:weeks?|uger?)$/i.test(unit) ? 7 : 1));
+	const ahead = text.match(new RegExp(`\\b(?:in|om)\\s+(${NUMBER_TOKEN})\\s+(days?|dage?|weeks?|uger?)\\b`, 'i'));
+	if (ahead) return after(unitDays(ahead[1], ahead[2]));
+	const ago = text.match(new RegExp(`\\b(${NUMBER_TOKEN})\\s+(days?|dage?|weeks?|uger?)\\s+(?:ago|siden)\\b`, 'i'));
+	if (ago) return after(-unitDays(ago[1], ago[2]));
+	const weekdays = resolveWeekdays(text, today, tense);
+	if (weekdays.length) return { date: weekdays[0], dates: weekdays.length > 1 ? weekdays : undefined };
+	if (/\b(?:next week|næste uge)\b/i.test(text)) return after(7);
+	return explicitDate(text, today, tense) ?? {};
+}
+
+type ClockReading = { time: string; assumed: boolean; alternative?: string };
+
+const clock = (hour: number, minute: number) => `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+function readTwelveHourClock(hour: number, minute: number, text: string): ClockReading | undefined {
+	if (!Number.isInteger(hour) || !Number.isInteger(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) return undefined;
+	if (hour === 0 || hour >= 12) return { time: clock(hour, minute), assumed: false };
+	// Nobody books dinner at 07:00 or the dentist at 03:00. Pick the likely half of the day, but say it was a guess.
+	const afternoon = !MORNING_CONTEXT.test(text) && (EVENING_CONTEXT.test(text) || hour <= 6);
 	return {
-		day: Number(monthFirst?.[2] || dayFirst?.[1]),
-		month: MONTH_INDEX.get(monthName) ?? -1,
-		year: Number(monthFirst?.[3] || dayFirst?.[3]) || undefined
+		time: clock(afternoon ? hour + 12 : hour, minute),
+		assumed: true,
+		alternative: clock(afternoon ? hour : hour + 12, minute)
 	};
 }
 
-function localDateKey(date: Date) {
-	const year = date.getFullYear();
-	const month = String(date.getMonth() + 1).padStart(2, '0');
-	const day = String(date.getDate()).padStart(2, '0');
-	return `${year}-${month}-${day}`;
-}
-
-function extractScheduledDate(text: string) {
-	const today = new Date();
-	today.setHours(0, 0, 0, 0);
-	const relative = new Date(today);
-	if (/\b(?:day after tomorrow|i overmorgen)\b/i.test(text)) {
-		relative.setDate(relative.getDate() + 2);
-		return localDateKey(relative);
-	}
-	if (/\b(?:tomorrow|i morgen)\b/i.test(text)) {
-		relative.setDate(relative.getDate() + 1);
-		return localDateKey(relative);
-	}
-	if (/\b(?:today|i dag)\b/i.test(text)) return localDateKey(relative);
-	if (/\b(?:yesterday|i går)\b/i.test(text)) {
-		relative.setDate(relative.getDate() - 1);
-		return localDateKey(relative);
-	}
-
-	const relativeAmount = text.match(new RegExp(`\\b(?:in|om)\\s+(${NUMBER_TOKEN})\\s+(days?|dage?|weeks?|uger?)\\b`, 'i'));
-	if (relativeAmount) {
-		const amount = numberFrom(relativeAmount[1]);
-		const multiplier = /weeks?|uger?/i.test(relativeAmount[2]) ? 7 : 1;
-		relative.setDate(relative.getDate() + amount * multiplier);
-		return localDateKey(relative);
-	}
-	const weekdayDates = extractWeekdayDates(text, today);
-	if (weekdayDates.length) return weekdayDates[0];
-	if (/\b(?:next week|næste uge)\b/i.test(text)) {
-		relative.setDate(relative.getDate() + 7);
-		return localDateKey(relative);
-	}
-
-	const explicit = explicitDateParts(text);
-	if (!explicit || explicit.month < 0 || explicit.month > 11 || explicit.day < 1 || explicit.day > 31) return undefined;
-	let year = explicit.year ?? today.getFullYear();
-	let scheduled = new Date(year, explicit.month, explicit.day);
-	const soundsHistorical = describesPastActivity(text) || /\b(?:earlier|tidligere)\b/i.test(text);
-	if (!explicit.year && !soundsHistorical && scheduled < today) {
-		year += 1;
-		scheduled = new Date(year, explicit.month, explicit.day);
-	}
-	return localDateKey(scheduled);
-}
-
-function extractScheduledTime(text: string) {
-	const meridiem = text.match(/\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b/i);
+function extractScheduledTime(text: string): ClockReading | undefined {
+	const meridiem = text.match(/\b(?:at\s+)?(\d{1,2})(?:[:.](\d{2}))?\s*(a\.?m\.?|p\.?m\.?)(?![\p{L}])/iu);
 	if (meridiem) {
-		let hour = Number(meridiem[1]) % 12;
-		if (meridiem[3].toLowerCase().startsWith('p')) hour += 12;
-		return `${String(hour).padStart(2, '0')}:${meridiem[2] || '00'}`;
-	}
-	const twentyFourHour = text.match(/\b(?:at\s+|klokken\s+|kl\.?\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b/i);
-	if (twentyFourHour) {
-		return `${String(Number(twentyFourHour[1])).padStart(2, '0')}:${twentyFourHour[2]}`;
-	}
-	const spokenClock = text.match(new RegExp(`\\b(?:at|klokken|kl\\.?)\\s+(${NUMBER_TOKEN})(?:\\s+(${NUMBER_TOKEN}))?\\b`, 'i'));
-	if (spokenClock) {
-		const hour = numberFrom(spokenClock[1]);
-		const minute = spokenClock[2] ? numberFrom(spokenClock[2]) : 0;
-		if (hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59) {
-			return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+		const hour = Number(meridiem[1]);
+		const minute = Number(meridiem[2] || 0);
+		if (hour >= 1 && hour <= 12 && minute <= 59) {
+			return { time: clock((hour % 12) + (/^p/i.test(meridiem[3]) ? 12 : 0), minute), assumed: false };
 		}
 	}
-	const danishHalf = text.match(new RegExp(`\\bhalv\\s+(${NUMBER_TOKEN})\\b`, 'i'));
+	const marked = text.match(/\b(?:kl\.?|klokken)\s*([01]?\d|2[0-3])[:.]([0-5]\d)\b/i);
+	if (marked) {
+		const hour = Number(marked[1]);
+		const minute = Number(marked[2]);
+		// Written Danish times are 24-hour ("kl. 7.30" is morning), but "kl. 3.30" is almost never the middle of the night.
+		return hour >= 1 && hour <= 6 ? readTwelveHourClock(hour, minute, text) : { time: clock(hour, minute), assumed: false };
+	}
+	const written = text.match(/(?<![\d.:/-])([01]?\d|2[0-3])[:.]([0-5]\d)(?![\d:]|\.\d)/);
+	if (written) {
+		const reading = readTwelveHourClock(Number(written[1]), Number(written[2]), text);
+		if (reading) return reading;
+	}
+	const spokenEnglish = text.match(
+		new RegExp(
+			`\\bat\\s+(${EN_HOUR_TOKEN})(?:\\s+(o'clock|fifteen|thirty|forty[- ]five))?\\b(?!\\s*(?:minutes?|mins?|hours?|%|km|kg|people|persons?|years?|times))`,
+			'i'
+		)
+	);
+	if (spokenEnglish) {
+		const reading = readTwelveHourClock(
+			numberFrom(spokenEnglish[1]),
+			EN_MINUTE_WORDS[spokenEnglish[2]?.toLowerCase() ?? ''] ?? 0,
+			text
+		);
+		if (reading) return reading;
+	}
+	const spokenDanish = text.match(new RegExp(`\\b(?:klokken|kl\\.?)\\s*(${DA_HOUR_TOKEN})\\b(?![.:]\\d)`, 'i'));
+	if (spokenDanish) {
+		const reading = readTwelveHourClock(numberFrom(spokenDanish[1]), 0, text);
+		if (reading) return reading;
+	}
+	const fromTarget = (target: number, minute: number, before: boolean) => {
+		if (!Number.isInteger(target) || target < 1 || target > 24) return undefined;
+		const hour = before ? (target + 23) % 24 : target % 24;
+		return readTwelveHourClock(hour === 0 ? 12 : hour, minute, text);
+	};
+	const danishHalf = text.match(new RegExp(`\\bhalv\\s+(${DA_HOUR_TOKEN})\\b`, 'i'));
 	if (danishHalf) {
-		const target = numberFrom(danishHalf[1]);
-		if (target >= 1 && target <= 24) return `${String((target + 23) % 24).padStart(2, '0')}:30`;
+		const reading = fromTarget(numberFrom(danishHalf[1]), 30, true);
+		if (reading) return reading;
 	}
-	const danishQuarter = text.match(new RegExp(`\\bkvart\\s+(over|i)\\s+(${NUMBER_TOKEN})\\b`, 'i'));
+	const danishQuarter = text.match(new RegExp(`\\bkvart\\s+(over|i)\\s+(${DA_HOUR_TOKEN})\\b`, 'i'));
 	if (danishQuarter) {
-		const target = numberFrom(danishQuarter[2]);
-		if (target >= 1 && target <= 24) {
-			const hour = danishQuarter[1].toLowerCase() === 'i' ? (target + 23) % 24 : target % 24;
-			return `${String(hour).padStart(2, '0')}:${danishQuarter[1].toLowerCase() === 'i' ? '45' : '15'}`;
-		}
+		const before = danishQuarter[1].toLowerCase() === 'i';
+		const reading = fromTarget(numberFrom(danishQuarter[2]), before ? 45 : 15, before);
+		if (reading) return reading;
 	}
-	if (/\bnoon\b/i.test(text)) return '12:00';
-	if (/\b(?:morning|om morgenen|i morgen tidlig)\b/i.test(text)) return '09:00';
-	if (/\b(?:afternoon|om eftermiddagen)\b/i.test(text)) return '14:00';
-	if (/\b(?:evening|om aftenen|i aften)\b/i.test(text)) return '19:00';
+	const englishHalf = text.match(new RegExp(`\\bhalf past\\s+(${EN_HOUR_TOKEN})\\b`, 'i'));
+	if (englishHalf) {
+		const reading = fromTarget(numberFrom(englishHalf[1]), 30, false);
+		if (reading) return reading;
+	}
+	const englishQuarter = text.match(new RegExp(`\\bquarter\\s+(past|to)\\s+(${EN_HOUR_TOKEN})\\b`, 'i'));
+	if (englishQuarter) {
+		const before = englishQuarter[1].toLowerCase() === 'to';
+		const reading = fromTarget(numberFrom(englishQuarter[2]), before ? 45 : 15, before);
+		if (reading) return reading;
+	}
+	if (/\bnoon\b/i.test(text)) return { time: '12:00', assumed: true };
+	if (/\b(?:morning|om morgenen|i morgen tidlig)\b/i.test(text)) return { time: '09:00', assumed: true };
+	if (/\b(?:formiddag|formiddagen)\b/i.test(text)) return { time: '10:00', assumed: true };
+	if (/\b(?:afternoon|eftermiddag|eftermiddagen)\b/i.test(text)) return { time: '14:00', assumed: true };
+	if (/\b(?:evening|tonight|aften|aftenen)\b/i.test(text)) return { time: '19:00', assumed: true };
 	return undefined;
+}
+
+type Schedule = { tense: Tense; date?: string; dates?: string[]; time?: ClockReading };
+
+/**
+ * Reads dates and times so that one piece of text has one meaning: a score ("7/10"), a measurement ("1.5 hours")
+ * or a clock time ("kl. 10.05") is never also read as a date.
+ */
+function parseSchedule(text: string, category: EntryCategory, today: Date): Schedule {
+	const tense = tenseOf(text);
+	let scrubbed = text.replace(MEASUREMENT_PATTERN, blank);
+	if (category === 'Wellbeing') {
+		scrubbed = scrubbed.replace(new RegExp(SCORE_SOURCE, 'giu'), blank).replace(/(?<![\d.,])(?<!(?:kl\.?|klokken|at)\s*)\d+[.,]\d+/gi, blank);
+	}
+	const dates = extractDates(scrubbed.replace(MARKED_CLOCK_PATTERN, blank), today, tense);
+	const timeText =
+		dates.tokenIndex === undefined || dates.tokenLength === undefined
+			? scrubbed
+			: scrubbed.slice(0, dates.tokenIndex) + ' '.repeat(dates.tokenLength) + scrubbed.slice(dates.tokenIndex + dates.tokenLength);
+	return { tense, date: dates.date, dates: dates.dates, time: extractScheduledTime(timeText) };
 }
 
 function durationMinutesFrom(text: string) {
@@ -304,58 +419,139 @@ function durationMinutesFrom(text: string) {
 	const minuteMatch = text.match(new RegExp(`(?:^|\\s)(${NUMBER_TOKEN})\\s*(?:minutes?|mins?|minutter?|min)(?=\\s|[,.!?]|$)`, 'i'));
 	const halfHours = /\b(?:an?\s+half|en\s+halv)\s+(?:hour|time)\b/i.test(text) ? 30 : /\bhalvanden\s+time\b/i.test(text) ? 90 : 0;
 	const quarters = /\b(?:three quarters|tre kvarter)\b/i.test(text) ? 45 : /\b(?:a quarter|et kvarter)\b/i.test(text) ? 15 : 0;
-	const total = (hourMatch ? numberFrom(hourMatch[1]) * 60 : 0) + (minuteMatch ? numberFrom(minuteMatch[1]) : 0) + halfHours + quarters;
+	const total = Math.round(
+		(hourMatch ? numberFrom(hourMatch[1]) * 60 : 0) + (minuteMatch ? numberFrom(minuteMatch[1]) : 0) + halfHours + quarters
+	);
 	return total || undefined;
 }
 
-function durationFrom(text: string, planned = false) {
-	const total = durationMinutesFrom(text);
-	return total ? `${total} minutes${planned ? ' planned' : ''}` : planned ? 'Activity planned' : 'Activity logged';
+function wellbeingScoreFrom(text: string) {
+	const match = text.match(SCORE_PATTERN);
+	if (!match) return undefined;
+	const score = numberFrom(match[1]);
+	return Number.isFinite(score) && score >= 0 && score <= 10 ? score : undefined;
 }
 
-function describesPastActivity(text: string) {
-	return /\b(yesterday|i går|last\s+\w+|sidste\s+\w+|went|had|was|were|did|finished|completed|trained|ran|cycled|swam|walked|hiked|meditated|worked out|exercised|gik|havde|var|gjorde|afsluttede|trænede|løb|cyklede|svømmede|vandrede|mediterede|motionerede)\b/i.test(text);
+function wellbeingTitle(text: string) {
+	if (/tinnitus/i.test(text)) return 'Tinnitus';
+	if (/\b(?:headache|migraine|hovedpine|migræne)\b/i.test(text)) return 'Headache';
+	if (/\b(?:slept|sleep|sov|søvn)\b/i.test(text)) return 'Sleep';
+	if (/\b(?:energy|energi|tired|træt)\b/i.test(text)) return 'Energy';
+	if (/\b(?:stress|anxiety|angst)\b/i.test(text)) return 'Stress';
+	if (/\b(?:mood|humør)/i.test(text)) return 'Mood';
+	return 'Wellbeing check-in';
 }
 
-function wellbeingDetail(text: string) {
-	const explicit = text.match(/(\d+(?:[.,]\d+)?)\s*(?:\/\s*10|out of 10|ud af 10)/i);
-	if (explicit) return `${explicit[1].replace(',', '.')} / 10`;
-	return /tinnitus/i.test(text) ? 'Tinnitus noted' : 'Wellbeing noted';
+function habitTitle(text: string) {
+	if (/\b(?:meditat|mediter)/i.test(text)) return 'Meditation';
+	if (/\byoga\b/i.test(text)) return 'Yoga';
+	if (/\b(?:swim|swam|svøm)/i.test(text)) return 'Swimming';
+	if (/\b(?:cycl|bike|biking|cykl|cykel)/i.test(text)) return 'Cycling';
+	if (/\b(?:run|ran|running|jog|jogging|jogged|løb|løbe|løbetur)\b/i.test(text)) return 'Running';
+	if (/\b(?:walk|walked|walking|hike|hiked|hiking|gåtur|gik en tur|vandre|vandrede|vandretur)\b/i.test(text)) return 'Walking';
+	if (/\b(?:read|reading|læse|læste|læser|læsning)\b/i.test(text)) return 'Reading';
+	return 'Training';
 }
 
-function extractDate(text: string) {
-	const explicit = explicitDateParts(text);
-	if (!explicit || explicit.month < 0 || explicit.month > 11) return null;
-	const month = MONTH_NAMES[explicit.month][0].toUpperCase() + MONTH_NAMES[explicit.month].slice(1);
-	return `${month} ${explicit.day}${explicit.year ? `, ${explicit.year}` : ''}`;
+function placeTitle(text: string) {
+	const named = text.match(/\b(?:called|named|kaldet|hedder)\s+(.+?)(?=[.!?,]|\s+(?:in|on|near|i|på|ved|nær)\s|$)/i)?.[1];
+	if (named?.trim()) return capitalize(named.trim());
+	const described = text
+		.replace(
+			/^(?:(?:i|we|jeg|vi)\s+)?(?:just\s+|lige\s+)?(?:found|discovered|save this place:?|want to visit|recommended|fandt|opdagede|gem dette sted:?|vil (?:gerne )?besøge|anbefalet)\s+/i,
+			''
+		)
+		.replace(/^(?:a|an|the|this|that|en|et|den|det|denne|dette)\s+/i, '')
+		.replace(/[.!?]+$/, '')
+		.trim();
+	if (!described) return 'Saved place';
+	return capitalize(described.length > 60 ? `${described.slice(0, 60).trimEnd()}…` : described);
 }
+
+const PEOPLE_STOP_WORDS = new Set([
+	'on',
+	'at',
+	'in',
+	'for',
+	'to',
+	'about',
+	'this',
+	'next',
+	'last',
+	'today',
+	'tomorrow',
+	'tonight',
+	'yesterday',
+	'from',
+	'by',
+	'around',
+	'after',
+	'before',
+	'på',
+	'i',
+	'om',
+	'til',
+	'kl',
+	'kl.',
+	'klokken',
+	'halv',
+	'kvart',
+	'den',
+	'næste',
+	'sidste',
+	'fra',
+	'efter',
+	'før',
+	'omkring',
+	'hos',
+	...WEEKDAY_ALIASES.flat(),
+	...MONTH_ALIASES
+]);
 
 function extractPeople(text: string) {
-	const match = text.match(
-		new RegExp(
-			`\\b(?:with|med)\\s+(.+?)(?=,?\\s+(?:(?:(?:on|den)\\s+)?(?:${MONTHS})\\s+\\d|today|tomorrow|yesterday|i dag|i morgen|i går|next\\s+\\w+|næste\\s+\\w+)|$)`,
-			'i'
-		)
-	);
-	if (!match) return [];
-	return match[1]
+	const start = text.match(/\b(?:with|med)\s+/i);
+	if (!start || start.index === undefined) return [];
+	const words: string[] = [];
+	for (const word of text.slice(start.index + start[0].length).split(/\s+/)) {
+		const bare = word.replace(/[.!?;:]+$/, '');
+		if (!bare || PEOPLE_STOP_WORDS.has(bare.toLocaleLowerCase('da-DK').replace(/,$/, '')) || /\d/.test(bare)) break;
+		words.push(bare);
+		if (bare !== word) break;
+	}
+	return words
+		.join(' ')
 		.replace(/,$/, '')
-		.split(/\s+(?:and|og)\s+|,\s*/i)
+		.split(/\s+(?:and|og|&)\s+|,\s*/i)
 		.map((name) => name.trim())
 		.filter(Boolean);
 }
 
-function relativeDateLabel(text: string) {
-	if (/\b(?:day after tomorrow|i overmorgen)\b/i.test(text)) return 'Day after tomorrow';
-	if (/\b(?:tomorrow|i morgen)\b/i.test(text)) return 'Tomorrow';
-	if (/\b(?:today|i dag)\b/i.test(text)) return 'Today';
-	if (/\b(?:yesterday|i går)\b/i.test(text)) return 'Yesterday';
-	const weekday = text.match(new RegExp(`\\b(?:(?:next|næste)\\s+)?(?:${WEEKDAY_PATTERN})\\b`, 'i'));
-	if (weekday) return weekday[0];
-	const relativeAmount = text.match(new RegExp(`\\b(?:in|om)\\s+${NUMBER_TOKEN}\\s+(?:days?|dage?|weeks?|uger?)\\b`, 'i'));
-	if (relativeAmount) return relativeAmount[0];
-	if (/\b(?:next week|næste uge)\b/i.test(text)) return text.match(/\b(?:next week|næste uge)\b/i)?.[0] || 'Next week';
-	return null;
+const SCHEDULE_PHRASES = [
+	/\b(?:the\s+)?day after tomorrow\b|\bi overmorgen\b|\b(?:the\s+)?day before yesterday\b|\bi forgårs\b/gi,
+	/\b(?:tomorrow|today|tonight|yesterday|i morgen(?:\s+tidlig)?|i dag|i aften|i går|i eftermiddag|i formiddag)\b/gi,
+	new RegExp(`\\b(?:(?:on|this|next|næste|last|sidste|på|i)\\s+)?(?:${WEEKDAY_PATTERN})s?\\b`, 'gi'),
+	/\b(?:next week|næste uge|this week|denne uge)\b/gi,
+	new RegExp(`\\b(?:in|om)\\s+${NUMBER_TOKEN}\\s+(?:days?|dage?|weeks?|uger?)\\b`, 'gi'),
+	new RegExp(`\\bat\\s+${EN_HOUR_TOKEN}(?:[:.]\\d{2})?(?:\\s*(?:a\\.?m\\.?|p\\.?m\\.?|o'clock))?(?![\\p{L}\\d])`, 'giu'),
+	new RegExp(`\\b(?:kl\\.?|klokken)\\s*${DA_HOUR_TOKEN}(?:[:.]\\d{2})?(?![\\p{L}\\d])`, 'giu'),
+	new RegExp(`\\b(?:halv|kvart\\s+(?:over|i))\\s+${DA_HOUR_TOKEN}\\b|\\b(?:half past|quarter\\s+(?:past|to))\\s+${EN_HOUR_TOKEN}\\b`, 'gi'),
+	/\b(?:in the (?:morning|afternoon|evening)|this (?:morning|afternoon|evening)|om (?:morgenen|eftermiddagen|aftenen))\b/gi,
+	new RegExp(
+		`\\b(?:(?:on|den|d\\.)\\s+)?(?:(?:${MONTHS})\\s+\\d{1,2}(?:st|nd|rd|th)?|\\d{1,2}(?:st|nd|rd|th)?\\.?(?:\\s+of)?\\s+(?:${MONTHS}))\\b(?:,?\\s+\\d{4})?`,
+		'gi'
+	),
+	/(?:\b(?:on|den|d\.)\s*)?\b\d{1,2}[/.-]\d{1,2}(?:[/.-]\d{2,4})?\b/g
+];
+
+function stripSchedulePhrases(text: string) {
+	let result = text;
+	for (const pattern of SCHEDULE_PHRASES) result = result.replace(pattern, ' ');
+	return result
+		.replace(/\s+/g, ' ')
+		.replace(/\s+([,.!?])/g, '$1')
+		.replace(/(?:[\s,;:–-]|\b(?:on|at|by|til|på|den|om|and|og))+$/i, '')
+		.replace(/^[\s,;:–-]+/, '')
+		.trim();
 }
 
 type Classification = {
@@ -371,90 +567,88 @@ type Routing = {
 	scheduledDate?: string;
 	scheduledDates?: string[];
 	scheduledTime?: string;
+	scheduledTimeAssumed?: boolean;
+	scheduledTimeAlternative?: string;
 	durationMinutes?: number;
 	reminderMinutes?: number;
 	externalProvider?: ExternalProvider;
 	syncStatus: EntrySyncStatus;
 };
 
-function routeEntry(text: string, category: EntryCategory): Routing {
-	const weekdayDates = extractWeekdayDates(text);
-	const scheduledDates = weekdayDates.length > 1 ? weekdayDates : undefined;
-	const scheduledDate = scheduledDates?.[0] || extractScheduledDate(text);
-	const scheduledTime = extractScheduledTime(text);
+function routeEntry(text: string, category: EntryCategory, schedule: Schedule, historical: boolean): Routing {
+	const timing = {
+		scheduledDate: schedule.date,
+		scheduledDates: schedule.dates,
+		scheduledTime: schedule.time?.time,
+		scheduledTimeAssumed: schedule.time?.assumed || undefined,
+		scheduledTimeAlternative: schedule.time?.alternative,
+		syncStatus: 'Local' as const
+	};
 	const explicitReminder = text.match(REMINDER_PATTERN);
-	const historical = describesPastActivity(text);
 	const calendarSignal = text.match(
-		/\b(appointment|meeting|dinner|lunch|brunch|drinks?|concert|evening out|party|date night|reservation|flight|dentist|doctor|aftale|møde|middag|frokost|koncert|bytur|fest|date|fly|tandlæge|læge)\b/i
+		/\b(appointment|meeting|dinner|lunch|brunch|drinks?|concert|evening out|party|date night|reservation|flight|dentist|doctor|hairdresser|cinema|theatre|aftale|møde|middag|frokost|koncert|bytur|fest|date|fly|tandlæge|læge|frisør|biograf|teater)\b/i
 	);
 
 	if (explicitReminder) {
 		return {
+			...timing,
 			destination: 'Reminder',
 			confidence: 'High',
 			reason: `Action inferred from “${explicitReminder[1]}”`,
-			 scheduledDate,
-			scheduledDates,
-			scheduledTime,
 			reminderMinutes: 0,
-			externalProvider: scheduledTime ? 'Google Calendar' : 'Google Tasks',
-			syncStatus: 'Local'
+			externalProvider: timing.scheduledTime ? 'Google Calendar' : 'Google Tasks'
 		};
 	}
 
-	if (!historical && calendarSignal && (scheduledDate || scheduledTime)) {
+	const upcoming = { durationMinutes: 60, reminderMinutes: 30, externalProvider: 'Google Calendar' as const };
+	if (!historical && calendarSignal && (timing.scheduledDate || timing.scheduledTime)) {
 		return {
+			...timing,
+			...upcoming,
 			destination: 'Calendar',
 			confidence: 'High',
-			reason: `Upcoming “${calendarSignal[1]}” with scheduling details`,
-			scheduledDate,
-			scheduledDates,
-			scheduledTime,
-			durationMinutes: 60,
-			reminderMinutes: 30,
-			externalProvider: 'Google Calendar',
-			syncStatus: 'Local'
+			reason: `Upcoming “${calendarSignal[1]}” with scheduling details`
 		};
 	}
 
-	if (!historical && category === 'Social' && scheduledDate) {
+	if (!historical && category === 'Reminder' && (timing.scheduledDate || timing.scheduledTime)) {
 		return {
-			destination: 'Calendar',
+			...timing,
+			destination: 'Reminder',
 			confidence: 'Medium',
-			reason: 'Future social entry with a date',
-			scheduledDate,
-			scheduledDates,
-			scheduledTime,
+			reason: 'Task with an upcoming date',
+			reminderMinutes: 0,
+			externalProvider: timing.scheduledTime ? 'Google Calendar' : 'Google Tasks'
+		};
+	}
+
+	if (!historical && category === 'Social' && timing.scheduledDate) {
+		return {
+			...timing,
+			...upcoming,
 			durationMinutes: 120,
-			reminderMinutes: 30,
-			externalProvider: 'Google Calendar',
-			syncStatus: 'Local'
+			destination: 'Calendar',
+			confidence: 'Medium',
+			reason: 'Future social entry with a date'
 		};
 	}
 
-	if (!historical && category === 'Habit' && scheduledDate) {
+	if (!historical && category === 'Habit' && timing.scheduledDate) {
 		return {
+			...timing,
+			...upcoming,
+			durationMinutes: durationMinutesFrom(text) || 60,
 			destination: 'Calendar',
 			confidence: 'Medium',
-			reason: 'Future habit with a scheduled date',
-			scheduledDate,
-			scheduledDates,
-			scheduledTime,
-			durationMinutes: durationMinutesFrom(text) || 60,
-			reminderMinutes: 30,
-			externalProvider: 'Google Calendar',
-			syncStatus: 'Local'
+			reason: 'Future habit with a scheduled date'
 		};
 	}
 
 	return {
+		...timing,
 		destination: 'Timeline',
 		confidence: historical ? 'High' : 'Medium',
-		reason: historical ? 'Captured as something that already happened' : 'No action was explicitly requested',
-		scheduledDate,
-		scheduledDates,
-		scheduledTime,
-		syncStatus: 'Local'
+		reason: historical ? 'Captured as something that already happened' : 'No action was explicitly requested'
 	};
 }
 
@@ -477,21 +671,22 @@ function classifyEntry(text: string): Classification {
 	};
 
 	match('Place', /\b(found|discovered|save this place|want to visit|recommend(?:ed)?|fandt|opdagede|gem dette sted|vil besøge|anbefalet)\b/i, 3);
-	match('Place', /\b(restaurant|bar|café|cafe|viewpoint|museum|bakery|hotel|place|udsigtspunkt|bageri|sted)\b/i, 2);
+	match('Place', /(?<![\p{L}])(restaurant|bar|café|cafe|viewpoint|museum|bakery|hotel|place|udsigtspunkt|bageri|sted)(?![\p{L}])/iu, 2);
 
 	match('Social', /\b(meeting|dinner|lunch|drinks?|concert|evening out|party|brunch|date night|catch(?:ing)? up|møde|middag|frokost|koncert|aften ude|bytur|fest)\b/i, 3);
 	match('Social', /\b(coffee|visit|meet|kaffe|besøg|mødes)\b/i, 2);
 	match('Social', /\b(?:with|med)\s+[\p{L}]/iu, 1, 'with someone');
 
-	match('Wellbeing', /\b(tinnitus|headache|migraine|mood|wellbeing|anxiety|stress|energy|pain|hovedpine|humør|velbefindende|angst|energi|smerte)\b/i, 3);
+	match('Wellbeing', /\b(tinnitus|headache|migraine|mood|wellbeing|anxiety|stress|energy|pain|hovedpine|migræne|humør|velbefindende|angst|energi|smerte)\b/i, 3);
 	match('Wellbeing', /\b(feel|feeling|felt|slept|sleep|føler|følelse|følte|sov|søvn)\b/i, 2);
+	if (wellbeingScoreFrom(text) !== undefined) add('Wellbeing', 1, 'a 0–10 score');
 
-	match('Habit', /\b(training|workout|exercise|gym|running|cycling|meditation|reading|træning|træningscenter|fitnesscenter|motion|løb|løbetur|cykling|meditation|læsning)\b/i, 3);
-	match('Habit', /\b(train|trained|ran|run|cycle|cycled|swam|swim|walked|hiked|meditat(?:e|ed)|read|worked out|træne|trænede|løbe|løb|cykle|cyklede|svømme|svømmede|gåtur|gik|vandre|vandrede|meditere|mediterede|læse|læste)\b/i, 3);
+	match('Habit', /\b(training|workout|exercise|gym|running|jogging|cycling|swimming|meditation|reading|yoga|padel|tennis|træning|træningscenter|fitnesscenter|motion|løb|løbetur|cykling|svømning|meditation|læsning)\b/i, 3);
+	match('Habit', /\b(train|trained|ran|run|jogged|cycle|cycled|swam|swim|walked|hiked|meditat(?:e|ed)|read|worked out|træne|trænede|løbe|cykle|cyklede|svømme|svømmede|gåtur|gik en tur|vandre|vandrede|meditere|mediterede|læse|læste)\b/i, 3);
 	match('Habit', new RegExp(`(?:^|\\s)${NUMBER_TOKEN}\\s*(?:hours?|hrs?|minutes?|mins?|timer?|minutter?|min)(?=\\s|[,.!?]|$)`, 'i'), 1, 'duration');
 
-	match('Reminder', /\b(appointment|dentist|doctor|deadline|aftale|tandlæge|læge|frist)\b/i, 3);
-	match('Reminder', /\b(call|email|book|buy|pick up|send|pay|ring|ringe|mail|booke|køb|købe|hent|hente|send|sende|betal|betale)\b/i, 2);
+	match('Reminder', /\b(appointment|dentist|doctor|hairdresser|deadline|aftale|tandlæge|læge|frisør|frist)\b/i, 3);
+	match('Reminder', /\b(call|email|book|buy|pick up|send|pay|ring|ringe|mail|booke|køb|købe|hent|hente|sende|betal|betale)\b/i, 2);
 
 	const ranked = [...scores.entries()].sort((left, right) => right[1].score - left[1].score);
 	const [winner, runnerUp] = ranked;
@@ -507,118 +702,118 @@ function classifyEntry(text: string): Classification {
 	};
 }
 
-export function interpretEntry(transcript: string): EntryDraft {
+/**
+ * Turns a spoken or typed capture into an editable draft. Deterministic: the same text and the same `now`
+ * always give the same draft. Anything that had to be guessed is marked so the confirmation can ask about it.
+ */
+export function interpretEntry(transcript: string, now = new Date()): EntryDraft {
 	const text = transcript.trim();
+	const today = addDays(now, 0);
+	const todayKey = localDateKey(today);
 	const classification = classifyEntry(text);
-	const routing = routeEntry(text, classification.category);
-	const classificationMeta = {
-		classificationConfidence: classification.confidence,
-		classificationReason: classification.reason
-	};
-	const routingMeta = {
+	const schedule = parseSchedule(text, classification.category, today);
+	// A resolved date decides the tense. Verb cues only decide when the entry is dated today or not dated at all.
+	const historical = schedule.date && schedule.date !== todayKey ? schedule.date < todayKey : schedule.tense === 'past';
+	const routing = routeEntry(text, classification.category, schedule, historical);
+	const base = {
+		transcript: text,
+		when: describeSchedule(routing.scheduledDate, routing.scheduledTime, todayKey),
 		destination: routing.destination,
 		destinationConfidence: routing.confidence,
 		destinationReason: routing.reason,
 		scheduledDate: routing.scheduledDate,
 		scheduledDates: routing.scheduledDates,
 		scheduledTime: routing.scheduledTime,
+		scheduledTimeAssumed: routing.scheduledTimeAssumed,
+		scheduledTimeAlternative: routing.scheduledTimeAlternative,
 		durationMinutes: routing.durationMinutes,
 		reminderMinutes: routing.reminderMinutes,
 		externalProvider: routing.externalProvider,
 		syncStatus: routing.syncStatus,
 		calendar: routing.destination === 'Calendar',
-		reminder: routing.destination === 'Reminder'
+		reminder: routing.destination === 'Reminder',
+		classificationConfidence: classification.confidence,
+		classificationReason: classification.reason
 	};
 
 	if (classification.category === 'Place') {
-		const named = text.match(/(?:called|named|kaldet|hedder)\s+(.+?)(?:[.!]|$)/i)?.[1];
 		return {
+			...base,
 			category: 'Place',
-			title: named || 'Saved place',
-			detail: /restaurant/i.test(text) ? 'Restaurant' : /bar/i.test(text) ? 'Bar' : 'Place to revisit',
-			when: 'Saved now',
-			transcript: text,
-			...routingMeta,
-			...classificationMeta
+			title: placeTitle(text),
+			detail: /\brestaurant\b/i.test(text)
+				? 'Restaurant'
+				: /\bbar\b/i.test(text)
+					? 'Bar'
+					: /(?<![\p{L}])caf[eé](?![\p{L}])/iu.test(text)
+						? 'Café'
+						: 'Place to revisit'
 		};
 	}
 
 	if (classification.category === 'Social') {
 		const people = extractPeople(text);
-		const date = extractDate(text);
-		const rawTitle = text.replace(/^(?:plan|log|planlæg|notér)\s+/i, '').split(/\s+(?:with|med)\s+/i)[0].trim();
+		const rawTitle = stripSchedulePhrases(
+			text.replace(/^(?:plan|log|planlæg|notér)\s+/i, '').split(/\s+(?:with|med)\s+/i)[0]
+		);
 		return {
+			...base,
 			category: 'Social',
-			title: rawTitle ? rawTitle[0].toUpperCase() + rawTitle.slice(1) : 'Social event',
+			title: rawTitle ? capitalize(rawTitle) : 'Social event',
 			detail: people.length ? `With ${people.join(' & ')}` : 'Social event',
-			when: date || relativeDateLabel(text) || 'Date not specified',
-			transcript: text,
 			people,
-			status: routing.scheduledDate && !describesPastActivity(text) ? 'Planned' : describesPastActivity(text) ? 'Completed' : 'Tentative',
-			...routingMeta,
-			...classificationMeta
+			status: historical ? 'Completed' : routing.scheduledDate ? 'Planned' : 'Tentative'
 		};
 	}
 
 	if (classification.category === 'Wellbeing') {
+		const wellbeingScore = wellbeingScoreFrom(text);
 		return {
+			...base,
 			category: 'Wellbeing',
-			title: /tinnitus/i.test(text) ? 'Tinnitus' : 'Wellbeing check-in',
-			detail: wellbeingDetail(text),
-			when: 'Today',
-			transcript: text,
-			...routingMeta,
-			...classificationMeta
+			title: wellbeingTitle(text),
+			detail: wellbeingScore !== undefined ? `${wellbeingScore} / 10` : /tinnitus/i.test(text) ? 'Tinnitus noted' : 'Wellbeing noted',
+			wellbeingScore
 		};
 	}
 
 	if (classification.category === 'Habit') {
-		const planned = Boolean(routing.scheduledDate && !describesPastActivity(text));
-		const title = /meditat/i.test(text)
-			? 'Meditation'
-			: /read|læs/i.test(text)
-				? 'Reading'
-				: /run|ran|løb/i.test(text)
-					? 'Running'
-					: 'Training';
+		const planned = Boolean(routing.scheduledDate) && !historical;
+		const activityMinutes = durationMinutesFrom(text);
 		return {
+			...base,
 			category: 'Habit',
-			title,
-			detail: durationFrom(text, planned),
-			when: planned ? extractDate(text) || relativeDateLabel(text) || 'Scheduled' : /\b(?:yesterday|i går)\b/i.test(text) ? 'Yesterday' : 'Today',
-			transcript: text,
-			status: planned ? 'Planned' : 'Completed',
-			...routingMeta,
-			...classificationMeta
+			title: habitTitle(text),
+			detail: activityMinutes
+				? `${activityMinutes} minutes${planned ? ' planned' : ''}`
+				: planned
+					? 'Activity planned'
+					: 'Activity logged',
+			activityMinutes,
+			status: planned ? 'Planned' : 'Completed'
 		};
 	}
 
 	if (classification.category === 'Reminder') {
-		const action = text
-			.replace(/^(?:remind me(?: to)?|remember to|don['’]?t forget(?: to)?|set (?:a |an )?reminder(?: to)?|mind mig om(?: at)?|husk at|glem ikke at|lav (?:en )?påmindelse(?: om at)?)\s*/i, '')
-			.replace(new RegExp(`\\s+(?:day after tomorrow|tomorrow|today|i overmorgen|i morgen|i dag|(?:next|næste)\\s+\\w+|(?:in|om)\\s+${NUMBER_TOKEN}\\s+(?:days?|dage?|weeks?|uger?)|(?:på\\s+)?(?:${WEEKDAY_PATTERN})|(?:at|klokken|kl\\.?)\\s+\\d.*).*`, 'i'), '')
-			.trim();
-		const when = /\b(?:tomorrow morning|i morgen tidlig)\b/i.test(text)
-			? 'Tomorrow · Morning'
-			: relativeDateLabel(text) || (routing.scheduledTime ? `At ${routing.scheduledTime}` : 'Needs a time');
+		const english = /^(?:remind me|remember|don['’]?t forget|set (?:a |an )?reminder)\b/i.test(text);
+		const action = stripSchedulePhrases(
+			text.replace(
+				/^(?:remind me(?: to)?|remember to|don['’]?t forget(?: to)?|set (?:a |an )?reminder(?: to)?|mind mig om(?: at)?|husk(?: at)?|glem ikke at|lav (?:en )?påmindelse(?: om at)?)\s*/i,
+				''
+			)
+		).replace(english ? /^(?:to|at)\s+/i : /^at\s+/i, '');
 		return {
+			...base,
 			category: 'Reminder',
-			title: action ? action[0].toUpperCase() + action.slice(1) : 'New reminder',
-			detail: 'Reminder saved in Trace',
-			when,
-			transcript: text,
-			...routingMeta,
-			...classificationMeta
+			title: action ? capitalize(action) : 'New reminder',
+			detail: 'Reminder saved in Trace'
 		};
 	}
 
 	return {
+		...base,
 		category: 'Note',
 		title: text.length > 42 ? `${text.slice(0, 42)}…` : text,
-		detail: 'General timeline entry',
-		when: 'Today',
-		transcript: text,
-		...routingMeta,
-		...classificationMeta
+		detail: 'General timeline entry'
 	};
 }
