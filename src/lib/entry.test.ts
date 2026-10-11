@@ -293,3 +293,65 @@ describe('regressions found while tightening the parser', () => {
 		expect(entry.scheduledDate).toBeUndefined();
 	});
 });
+
+describe('shopping list', () => {
+	test('one capture can add several items', () => {
+		const entry = read('Mangler mælk, æg og kaffe');
+		expect(entry.category).toBe('Shopping');
+		expect(entry.destination).toBe('List');
+		expect(entry.listItems).toEqual(['Mælk', 'Æg', 'Kaffe']);
+	});
+
+	test('understands English and list phrasing, and drops articles', () => {
+		expect(read('We need milk and bread').listItems).toEqual(['Milk', 'Bread']);
+		expect(read('Vi mangler noget toiletpapir').listItems).toEqual(['Toiletpapir']);
+		expect(read('Skriv opvasketabs på listen').listItems).toEqual(['Opvasketabs']);
+		expect(read('Add batteries to the shopping list').listItems).toEqual(['Batteries']);
+	});
+
+	test('buying without a day goes on the list; with a day it stays a task', () => {
+		expect(read('Køb batterier').destination).toBe('List');
+		const dated = read('Køb blomster til Anna fredag');
+		expect(dated.destination).toBe('Reminder');
+		expect(dated.scheduledDate).toBe('2026-10-02');
+	});
+
+	test('needing to do something is not shopping', () => {
+		expect(read('I need to call mom').category).not.toBe('Shopping');
+		expect(read('Jeg mangler at ringe til Peter').category).not.toBe('Shopping');
+		expect(read('Husk mælk').category).toBe('Reminder');
+	});
+});
+
+describe('notes about people', () => {
+	const known = (text: string) => interpretEntry(text, WEDNESDAY, { knownPeople: ['Anna', 'Lars'] });
+
+	test('"Om Anna:" teaches a new name', () => {
+		const entry = read('Om Anna: hendes søn hedder Oskar');
+		expect(entry.category).toBe('Person');
+		expect(entry.person).toBe('Anna');
+		expect(entry.title).toBe('Hendes søn hedder Oskar');
+	});
+
+	test('works when speech recognition leaves out the colon', () => {
+		expect(read('Om Mads allergisk over for nødder').person).toBe('Mads');
+	});
+
+	test('a sentence that starts with a known name is a note about them', () => {
+		expect(known('Anna er allergisk over for nødder').person).toBe('Anna');
+		expect(known("Lars' datter starter i skole").person).toBe('Lars');
+	});
+
+	test('dates in a person note are content, not a schedule', () => {
+		const entry = known('Annas fødselsdag er 3. maj');
+		expect(entry.person).toBe('Anna');
+		expect(entry.scheduledDate).toBeUndefined();
+	});
+
+	test('plans with a known person stay plans, and similar words are not names', () => {
+		expect(known('Middag med Anna fredag kl 19').category).toBe('Social');
+		expect(known('Anna middag fredag').category).not.toBe('Person');
+		expect(known('Annual check at the doctor').category).not.toBe('Person');
+		expect(read('Om to uger skal jeg til tandlæge').category).not.toBe('Person');
+	});
+});

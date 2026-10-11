@@ -87,3 +87,10 @@ describe('wellbeing scores', () => {
 		expect(insights.stories[3]).toContain('down from 7.0');
 	});
 });
+
+describe('shopping items', () => {
+	test('are never counted as traces', () => {
+		const insights = computeInsights([entry('milk', { category: 'Shopping', destination: 'List' }), entry('note', {})], 7, TODAY);
+		expect(insights.entries.map((item) => item.id)).toEqual(['note']);
+	});
+});

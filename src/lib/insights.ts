@@ -3,7 +3,8 @@ import { addDays, localDateKey, parseDateKey } from './dates';
 
 export type InsightRange = 7 | 30 | 'all';
 
-export const INSIGHT_CATEGORIES: EntryCategory[] = ['Wellbeing', 'Habit', 'Reminder', 'Place', 'Social', 'Note'];
+/** Categories that live on the timeline. Shopping items are a list, not traces. */
+export const INSIGHT_CATEGORIES: EntryCategory[] = ['Wellbeing', 'Habit', 'Reminder', 'Place', 'Social', 'Person', 'Note'];
 
 const MAX_WEEK_BARS = 26;
 
@@ -46,7 +47,7 @@ export type InsightBar = { key: string; label: string; count: number; current: b
 
 export function computeInsights(timeline: TimelineEntry[], range: InsightRange, todayKey: string) {
 	const today = parseDateKey(todayKey);
-	const past = timeline.filter((entry) => entryDateKey(entry) <= todayKey);
+	const past = timeline.filter((entry) => entry.destination !== 'List' && entryDateKey(entry) <= todayKey);
 	const earliest = past.reduce((first, entry) => (entryDateKey(entry) < first ? entryDateKey(entry) : first), todayKey);
 	const startKey = range === 'all' ? earliest : localDateKey(addDays(today, -(range - 1)));
 	const entries = past.filter((entry) => entryDateKey(entry) >= startKey);

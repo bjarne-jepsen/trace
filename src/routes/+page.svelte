@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import {
+		ENTRY_CATEGORIES,
 		interpretEntry,
+		shoppingItemKey,
 		type EntryCategory,
 		type EntryDestination,
 		type EntryDraft,
@@ -61,6 +63,7 @@
 
 	const bars = [12, 20, 31, 17, 39, 24, 45, 28, 36, 18, 29, 14];
 	const insightCategories = INSIGHT_CATEGORIES;
+	const entryCategories = ENTRY_CATEGORIES;
 	const destinations: EntryDestination[] = ['Timeline', 'Calendar', 'Reminder'];
 	const wellbeingScores = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 	// Placeholder details say nothing the category does not already say, so lists leave them out.
@@ -104,7 +107,7 @@
 	let draftSaveError = $state('');
 	let notice = $state('');
 	let noticeAction = $state<NoticeAction>(null);
-	let recentlyDeleted = $state<TimelineEntry | null>(null);
+	let recentlyDeleted = $state<TimelineEntry[]>([]);
 	let editingEntry = $state<TimelineEntry | null>(null);
 	let editingPeople = $state('');
 	let editingScore = $state('');
@@ -148,10 +151,28 @@
 		captureState === 'processing' ? 'Finishing capture…' :
 		'Tap once, then speak naturally'
 	);
-	const todayEntries = $derived(timeline.filter((entry) => entryTimelineDate(entry) === todayKey));
+	// Shopping items are a list, not things that happen, so every timeline view works on traces.
+	const traces = $derived(timeline.filter((entry) => entry.destination !== 'List'));
+	const shoppingItems = $derived(
+		timeline.filter((entry) => entry.destination === 'List').sort((left, right) => left.capturedAt.localeCompare(right.capturedAt))
+	);
+	const shoppingOpen = $derived(shoppingItems.filter((entry) => entry.status !== 'Completed'));
+	const shoppingBought = $derived(shoppingItems.filter((entry) => entry.status === 'Completed'));
+	const knownPeople = $derived.by(() => {
+		const names = new Map<string, string>();
+		for (const entry of traces) {
+			for (const name of [entry.person, ...(entry.people || [])]) {
+				const clean = name?.trim();
+				if (clean && clean.length > 1) names.set(clean.toLocaleLowerCase('da-DK'), clean);
+			}
+		}
+		return [...names.values()];
+	});
+	const personNotes = $derived(traces.filter((entry) => entry.category === 'Person' && entry.person));
+	const todayEntries = $derived(traces.filter((entry) => entryTimelineDate(entry) === todayKey));
 	const todaySpineEntries = $derived([...todayEntries].sort(compareTimelineDateAscending));
 	const overdueAttentionEntries = $derived(
-		timeline
+		traces
 			.filter(
 				(entry) =>
 					entryTimelineDate(entry) < todayKey &&
@@ -161,21 +182,21 @@
 			.sort(compareTimelineDateAscending)
 	);
 	const aheadEntries = $derived(
-		timeline.filter((entry) => entryTimelineDate(entry) > todayKey).sort(compareTimelineDateAscending)
+		traces.filter((entry) => entryTimelineDate(entry) > todayKey).sort(compareTimelineDateAscending)
 	);
 	const pastEntries = $derived(
-		timeline
+		traces
 			.filter((entry) => entryTimelineDate(entry) < todayKey && !overdueAttentionEntries.some((attention) => attention.id === entry.id))
 			.sort(compareTimelineDateDescending)
 	);
-	const insights = $derived(computeInsights(timeline, insightRange, todayKey));
+	const insights = $derived(computeInsights(traces, insightRange, todayKey));
 	const maxInsightBar = $derived(Math.max(1, ...insights.bars.map((bar) => bar.count)));
 	const insightRangeLabel = $derived(
 		insightRange === 'all' ? (insights.weeksCapped ? 'Last 26 weeks' : 'All time') : `Last ${insightRange} days`
 	);
 	const filteredTimeline = $derived.by(() => {
 		const query = timelineQuery.trim().toLocaleLowerCase();
-		return timeline.filter((entry) => {
+		return traces.filter((entry) => {
 			if (timelineFilter !== 'All' && entry.category !== timelineFilter) return false;
 			if (!query) return true;
 			return [
@@ -185,15 +206,16 @@
 				entry.category,
 				entry.destination,
 				entry.placeAddress,
+				entry.person,
 				entry.people?.join(' ')
 			].filter(Boolean).join(' ').toLocaleLowerCase().includes(query);
 		});
 	});
 	const timelineGroups = $derived(groupTimelineEntries(filteredTimeline, 'desc'));
-	const availableTimelineCategories = $derived(insightCategories.filter((category) => timeline.some((entry) => entry.category === category)));
+	const availableTimelineCategories = $derived(insightCategories.filter((category) => traces.some((entry) => entry.category === category)));
 	// A calendar event whose day has passed has happened; only reminders can be overdue.
 	const actionableEntries = $derived.by(() =>
-		timeline
+		traces
 			.filter(
 				(entry) =>
 					entry.status !== 'Completed' &&
@@ -246,7 +268,7 @@
 		return `Today${draft.scheduledTime ? ` · ${formatClockTime(draft.scheduledTime)}` : ''}`;
 	});
 	const draftClarification = $derived.by<DraftClarification | null>(() => {
-		if (!draft || draft.destination === 'Timeline') return null;
+		if (!draft || draft.destination === 'Timeline' || draft.destination === 'List') return null;
 		if (!draft.scheduledDate) {
 			return {
 				kind: 'date',
@@ -395,7 +417,7 @@
 		noticeTimeout = window.setTimeout(() => {
 			notice = '';
 			noticeAction = null;
-			if (action === 'undo') recentlyDeleted = null;
+			if (action === 'undo') recentlyDeleted = [];
 		}, duration);
 	}
 
@@ -416,7 +438,7 @@
 		liveTranscript = cleaned;
 		draftSaveError = '';
 		captureState = 'processing';
-		draft = interpretEntry(cleaned);
+		draft = interpretEntry(cleaned, new Date(), { knownPeople });
 		showDraftDetails = false;
 		draftTimeConfirmed = Boolean(draft.scheduledTime);
 		placeLocationState = 'idle';
@@ -595,7 +617,7 @@
 		showManual = keepTypedCapture;
 		liveTranscript = value;
 		captureState = 'processing';
-		draft = interpretEntry(value);
+		draft = interpretEntry(value, new Date(), { knownPeople });
 		showDraftDetails = false;
 		draftTimeConfirmed = Boolean(draft.scheduledTime);
 		placeLocationState = 'idle';
@@ -616,6 +638,125 @@
 		if (!draft) return;
 		draft.classificationConfidence = 'User selected';
 		draft.classificationReason = 'Category changed during confirmation';
+		if (draft.category === 'Shopping' && draft.destination !== 'List') {
+			draft.destination = 'List';
+			draft.listItems = [draft.title];
+			draft.status = 'Planned';
+		} else if (draft.category !== 'Shopping' && draft.destination === 'List') {
+			draft.destination = 'Timeline';
+			draft.listItems = undefined;
+			draft.status = undefined;
+			draft.title = draft.transcript.length > 60 ? `${draft.transcript.slice(0, 60)}…` : draft.transcript;
+			draft.detail = 'General timeline entry';
+		}
+		if (draft.category === 'Person' && !draft.person) draft.person = draft.people?.[0] ?? '';
+	}
+
+	/** People mentioned in an entry, with what Trace already knows about each of them. */
+	function notesAbout(names: string[] | undefined, excludeId?: string) {
+		const wanted = new Set((names || []).map((name) => name.toLocaleLowerCase('da-DK')));
+		if (!wanted.size) return [];
+		return personNotes
+			.filter((note) => note.id !== excludeId && wanted.has(note.person!.toLocaleLowerCase('da-DK')))
+			.sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
+	}
+
+	function startsWithName(note: TimelineEntry) {
+		return Boolean(note.person && note.title.toLocaleLowerCase('da-DK').startsWith(note.person.toLocaleLowerCase('da-DK')));
+	}
+
+	function removeDraftListItem(index: number) {
+		if (!draft?.listItems) return;
+		draft.listItems = draft.listItems.filter((_, itemIndex) => itemIndex !== index);
+		draft.title = draft.listItems.join(', ');
+	}
+
+	// Saying an item that is already on the list does not add it twice; an item bought earlier goes back on the list.
+	async function saveShoppingDraft() {
+		if (!draft?.listItems?.length) {
+			draftSaveError = 'Add at least one item.';
+			return;
+		}
+		savingDraft = true;
+		const now = new Date();
+		const time = now.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+		const existing = new Map(shoppingItems.map((entry) => [shoppingItemKey(entry.title), entry]));
+		const toSave: TimelineEntry[] = [];
+		let alreadyThere = 0;
+		draft.listItems.forEach((item, index) => {
+			const capturedAt = new Date(now.getTime() + index).toISOString();
+			const match = existing.get(shoppingItemKey(item));
+			if (match && match.status !== 'Completed') {
+				alreadyThere += 1;
+				return;
+			}
+			toSave.push(
+				match
+					? { ...match, status: 'Planned', capturedAt, time }
+					: {
+							id: crypto.randomUUID(),
+							category: 'Shopping',
+							title: item.trim(),
+							detail: 'Shopping list',
+							when: 'On the list',
+							transcript: draft!.transcript,
+							destination: 'List',
+							status: 'Planned',
+							syncStatus: 'Local',
+							classificationConfidence: draft!.classificationConfidence,
+							classificationReason: draft!.classificationReason,
+							time,
+							capturedAt
+						}
+			);
+		});
+		try {
+			if (toSave.length) await saveLocalEntries(toSave);
+			const savedIds = new Set(toSave.map((entry) => entry.id));
+			timeline = [...toSave, ...timeline.filter((entry) => !savedIds.has(entry.id))];
+			if (storagePersisted !== true) void protectStorage();
+			draft = null;
+			captureOpen = false;
+			editing = false;
+			haptic([10, 35, 18]);
+			const added = toSave.length;
+			showToast(
+				added
+					? `${added} added to the shopping list${alreadyThere ? ` · ${alreadyThere} already there` : ''}`
+					: 'Already on the shopping list',
+				'capture',
+				5200
+			);
+		} catch {
+			draftSaveError = 'The list could not be saved. Please try again.';
+		} finally {
+			savingDraft = false;
+		}
+	}
+
+	async function toggleShoppingItem(entry: TimelineEntry) {
+		const updated: TimelineEntry = { ...entry, status: entry.status === 'Completed' ? 'Planned' : 'Completed' };
+		try {
+			await saveLocalEntry(updated);
+			timeline = timeline.map((item) => (item.id === updated.id ? updated : item));
+			haptic(8);
+		} catch {
+			showToast('That item could not be updated');
+		}
+	}
+
+	async function clearBoughtItems() {
+		const bought = [...shoppingBought];
+		if (!bought.length) return;
+		try {
+			for (const entry of bought) await deleteLocalEntry(entry.id);
+			const removed = new Set(bought.map((entry) => entry.id));
+			timeline = timeline.filter((entry) => !removed.has(entry.id));
+			recentlyDeleted = bought;
+			showToast(`${bought.length} bought ${bought.length === 1 ? 'item' : 'items'} cleared`, 'undo', 6000);
+		} catch {
+			showToast('The bought items could not be cleared');
+		}
 	}
 
 	function setDraftDestination(destination: EntryDestination) {
@@ -833,7 +974,7 @@
 		return (
 			typeof entry.id === 'string' &&
 			typeof entry.category === 'string' &&
-			insightCategories.includes(entry.category as EntryCategory) &&
+			entryCategories.includes(entry.category as EntryCategory) &&
 			typeof entry.title === 'string' &&
 			typeof entry.detail === 'string' &&
 			typeof entry.when === 'string' &&
@@ -977,6 +1118,18 @@
 	async function confirmDraft() {
 		if (!draft || savingDraft) return;
 		draftSaveError = '';
+		if (draft.destination === 'List') return saveShoppingDraft();
+		if (draft.category === 'Person') {
+			draft.person = draft.person?.trim() || '';
+			if (!draft.person) {
+				draftSaveError = 'Add who this note is about.';
+				return;
+			}
+			draft.people = [draft.person];
+			if (!draft.detail.trim() || draft.detail.startsWith('About ')) draft.detail = `About ${draft.person}`;
+		} else {
+			draft.person = undefined;
+		}
 		if (!draft.title.trim() || !draft.detail.trim()) {
 			draftSaveError = 'Add a title and details before saving.';
 			return;
@@ -1006,7 +1159,7 @@
 		const occurrenceDates = draft.scheduledDates?.length ? [...new Set(draft.scheduledDates)].sort() : [draft.scheduledDate];
 		const datesToSave = occurrenceDates.filter((date): date is string => Boolean(date));
 		const seriesId = datesToSave.length > 1 ? crypto.randomUUID() : undefined;
-		const { scheduledDates: _scheduledDates, ...draftFields } = draft;
+		const { scheduledDates: _scheduledDates, listItems: _listItems, ...draftFields } = draft;
 		const entries: TimelineEntry[] = (datesToSave.length ? datesToSave : [undefined]).map((scheduledDate, index) => ({
 			...draftFields,
 			scheduledDate,
@@ -1045,23 +1198,23 @@
 		try {
 			await deleteLocalEntry(entry.id);
 			timeline = timeline.filter((item) => item.id !== entry.id);
-			recentlyDeleted = entry;
+			recentlyDeleted = [entry];
 			haptic(12);
-			showToast('Entry deleted', 'undo', 6000);
+			showToast(entry.destination === 'List' ? 'Item removed' : 'Entry deleted', 'undo', 6000);
 		} catch {
 			showToast('That entry could not be deleted');
 		}
 	}
 
 	async function undoDelete() {
-		if (!recentlyDeleted) return;
-		const entry = recentlyDeleted;
+		if (!recentlyDeleted.length) return;
+		const entries = recentlyDeleted;
 		try {
-			await saveLocalEntry(entry);
-			timeline = [...timeline, entry].sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
-			recentlyDeleted = null;
+			await saveLocalEntries(entries);
+			timeline = [...timeline, ...entries].sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
+			recentlyDeleted = [];
 			haptic([8, 28, 12]);
-			showToast('Entry restored');
+			showToast(entries.length === 1 ? 'Restored' : `${entries.length} restored`);
 		} catch {
 			showToast('That entry could not be restored');
 		}
@@ -1098,7 +1251,7 @@
 	function reinterpretEditedCapture() {
 		if (!editingEntry?.transcript.trim()) return;
 		const current = editingEntry;
-		const interpreted = interpretEntry(current.transcript.trim());
+		const interpreted = interpretEntry(current.transcript.trim(), new Date(), { knownPeople });
 		const occurrenceDate = interpreted.scheduledDates?.[current.occurrenceIndex || 0] || interpreted.scheduledDate;
 		const { scheduledDates: _scheduledDates, ...singleOccurrence } = interpreted;
 		editingEntry = {
@@ -1143,9 +1296,12 @@
 			scheduledTimeAlternative: timeChanged ? undefined : editingEntry.scheduledTimeAlternative,
 			wellbeingScore: score,
 			when: scheduledDate ? `${formatScheduledDate(scheduledDate)}${scheduledTime ? ` at ${scheduledTime}` : ''}` : 'Captured',
+			person: editingEntry.category === 'Person' ? editingEntry.person?.trim() || undefined : undefined,
 			people: editingEntry.category === 'Social'
 				? editingPeople.split(/,|\band\b/i).map((person) => person.trim()).filter(Boolean)
-				: undefined,
+				: editingEntry.category === 'Person' && editingEntry.person?.trim()
+					? [editingEntry.person.trim()]
+					: undefined,
 			classificationConfidence: categoryChanged ? 'User selected' : editingEntry.classificationConfidence,
 			classificationReason: categoryChanged ? 'Category changed after capture' : editingEntry.classificationReason,
 			calendar: editingEntry.destination === 'Calendar',
@@ -1171,8 +1327,11 @@
 			updated.mapsSearchUrl = undefined;
 			updated.mapsPinUrl = undefined;
 		}
+		if (updated.category === 'Person' && updated.person && updated.detail.startsWith('About ')) updated.detail = `About ${updated.person}`;
 		editError = !updated.title
 			? 'Add a title before saving.'
+			: updated.category === 'Person' && !updated.person
+				? 'Add who this note is about.'
 			: !updated.detail
 				? 'Add details before saving.'
 				: updated.destination !== 'Timeline' && !updated.scheduledDate
@@ -1391,6 +1550,25 @@
 					<span>{actionableEntries.length}</span>
 				</header>
 
+				{#if !loadingEntries}
+					<section class="shopping-list" aria-labelledby="shopping-title">
+						<div class="shopping-heading"><h2 id="shopping-title">Shopping list</h2><small>{shoppingOpen.length ? `${shoppingOpen.length} to buy` : 'Nothing to buy'}</small></div>
+						{#if shoppingItems.length === 0}
+							<p class="shopping-hint">Say “mangler mælk og æg” or “we need coffee” to add items.</p>
+						{:else}
+							<ul>
+								{#each shoppingOpen as item (item.id)}
+									<li><button class="shopping-check" type="button" role="checkbox" aria-checked="false" onclick={() => toggleShoppingItem(item)}><span aria-hidden="true"></span><em>{item.title}</em></button><button class="shopping-remove" type="button" onclick={() => deleteEntryWithUndo(item)} aria-label={`Remove ${item.title}`}>×</button></li>
+								{/each}
+								{#each shoppingBought as item (item.id)}
+									<li class="bought"><button class="shopping-check" type="button" role="checkbox" aria-checked="true" onclick={() => toggleShoppingItem(item)}><span aria-hidden="true">✓</span><em>{item.title}</em></button><button class="shopping-remove" type="button" onclick={() => deleteEntryWithUndo(item)} aria-label={`Remove ${item.title}`}>×</button></li>
+								{/each}
+							</ul>
+							{#if shoppingBought.length}<button class="shopping-clear" type="button" onclick={clearBoughtItems}>Clear {shoppingBought.length} bought</button>{/if}
+						{/if}
+					</section>
+				{/if}
+
 				{#if loadingEntries}
 					<div class="upcoming-empty"><span class="spinner dark"></span><p>Opening your plans…</p></div>
 				{:else if actionableEntries.length === 0}
@@ -1402,6 +1580,7 @@
 								<div class="upcoming-group-heading"><h2>{group.label}</h2><span>{group.entries.length}</span></div>
 								<div class="upcoming-list">
 									{#each group.entries as entry (entry.id)}
+										{@const notes = notesAbout(entry.people)}
 										<article class={`upcoming-item ${entry.destination.toLowerCase()}`}>
 											<div class="upcoming-item-top"><span class="upcoming-symbol" aria-hidden="true">{entry.destination === 'Calendar' ? '▦' : '!'}</span><div><div class="upcoming-meta"><span>{entry.destination}</span>{#if entry.category !== entry.destination}<i>·</i><span>{entry.category}</span>{/if}</div><h3>{entry.title}</h3></div></div>
 											<p class="upcoming-detail">“{entry.transcript}”</p>
@@ -1410,6 +1589,7 @@
 												{#if entry.destination === 'Calendar' && entry.durationMinutes}<span><i>↔</i>{entry.durationMinutes} minutes</span>{/if}
 												{#if entry.people?.length}<span><i>☺</i>{entry.people.join(' & ')}</span>{/if}
 											</div>
+											{#if notes.length}<div class="person-notes"><b>What you know</b><ul>{#each notes.slice(0, 3) as note (note.id)}<li>{#if (entry.people?.length || 0) > 1 && !startsWithName(note)}<span>{note.person}</span>{/if}{note.title}</li>{/each}</ul></div>{/if}
 											<div class="upcoming-actions">
 												<button type="button" onclick={() => beginEntryEdit(entry)}>{entry.scheduledDate ? 'Reschedule or edit' : 'Add a date'}</button>
 												{#if entry.destination === 'Reminder'}<button class="complete" type="button" onclick={() => completeReminder(entry)}>Mark done</button>{/if}
@@ -1515,6 +1695,9 @@
 							<label>Category<select bind:value={editingEntry.category}>{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select></label>
 							<label>Title<input bind:value={editingEntry.title} required /></label>
 							<label class="wide">Details<input bind:value={editingEntry.detail} required /></label>
+							{#if editingEntry.category === 'Person'}
+								<label class="wide">About<input bind:value={editingEntry.person} placeholder="Name" /></label>
+							{/if}
 							{#if editingEntry.category === 'Wellbeing'}
 								<label>Score<select bind:value={editingScore}><option value="">No score</option>{#each wellbeingScores as score}<option value={String(score)}>{score} / 10</option>{/each}</select></label>
 							{/if}
@@ -1558,9 +1741,14 @@
 					<div class="sheet-heading"><div><span class="success-ring">✓</span><div><p>Here’s what I heard</p><h2 id="confirm-title">{draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length} entries` : 'Confirm your entry'}</h2></div></div><button type="button" onclick={dismissDraft} aria-label="Back to capture">×</button></div>
 					<blockquote>“{draft.transcript}”</blockquote>
 					<div class="interpreted-card">
-						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select>{#if draft.destination !== 'Timeline'}<span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{/if}{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
+						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each entryCategories as category}<option value={category}>{category}</option>{/each}</select>{#if draft.destination !== 'Timeline'}<span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{/if}{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
 						{#if showDraftDetails && draft.classificationReason}<p class="classification-reason"><span>⌁</span>{draft.classificationReason} · {draft.classificationConfidence || 'Low'} confidence</p>{/if}
-						{#if editing}
+						{#if draft.destination === 'List'}
+							<div class="draft-list">
+								<p>{draft.listItems?.length === 1 ? 'This goes on your shopping list' : `These ${draft.listItems?.length ?? 0} go on your shopping list`}</p>
+								<ul>{#each draft.listItems || [] as item, index (`${item}-${index}`)}<li><span>{item}</span><button type="button" onclick={() => removeDraftListItem(index)} aria-label={`Remove ${item}`}>×</button></li>{/each}</ul>
+							</div>
+						{:else if editing}
 							<div class="edit-fields"><label>Title<input bind:value={draft.title} /></label><label>Detail<input bind:value={draft.detail} /></label></div>
 						{:else}
 							<div class="entry-summary">
@@ -1568,7 +1756,8 @@
 								<div class="event-facts">
 									<div><span>When</span><b>{draftWhen}{#if draft.scheduledTimeAssumed && !draft.scheduledTimeAlternative}<em class="guess-tag">approx.</em>{/if}</b>{#if draft.scheduledTimeAssumed && draft.scheduledTimeAlternative}<button class="time-swap" type="button" onclick={useAlternativeTime} aria-label={`Change the time to ${draft.scheduledTimeAlternative}`}>or {draft.scheduledTimeAlternative}?</button>{/if}</div>
 									{#if draft.category === 'Social'}<div><span>People</span><b>{draft.people?.join(' & ') || 'Not specified'}</b></div>{/if}
-									{#if draft.category !== 'Social' && draft.category !== 'Wellbeing' && !fillerDetails.has(draft.detail)}<div><span>Detail</span><b>{draft.detail}</b></div>{/if}
+									{#if draft.category === 'Person'}<div><span>About</span><input class="about-input" bind:value={draft.person} placeholder="Name" aria-label="Who this note is about" /></div>{/if}
+									{#if draft.category !== 'Social' && draft.category !== 'Wellbeing' && draft.category !== 'Person' && !fillerDetails.has(draft.detail)}<div><span>Detail</span><b>{draft.detail}</b></div>{/if}
 								</div>
 								{#if draft.category === 'Wellbeing'}
 									<div class="score-picker" role="group" aria-label="Score from 0 to 10, optional"><p><b>Score</b><small>{draft.wellbeingScore === undefined ? 'Optional · tap to add' : 'Tap again to clear'}</small></p><div>{#each wellbeingScores as score}<button type="button" class:selected={draft.wellbeingScore === score} aria-pressed={draft.wellbeingScore === score} onclick={() => setDraftScore(score)}>{score}</button>{/each}</div></div>
@@ -1576,6 +1765,10 @@
 							</div>
 						{/if}
 					</div>
+
+					{#if draft.category !== 'Person' && notesAbout(draft.people).length}
+						<section class="person-notes draft-notes" aria-label="What you know"><b>What you know</b><ul>{#each notesAbout(draft.people).slice(0, 3) as note (note.id)}<li>{#if !startsWithName(note)}<span>{note.person}</span>{/if}{note.title}</li>{/each}</ul></section>
+					{/if}
 
 					{#if draft.scheduledDates && draft.scheduledDates.length > 1}
 						<section class="multi-date-card" aria-label="Inferred dates">
@@ -1599,7 +1792,7 @@
 						</section>
 					{/if}
 
-					<button class="confirmation-detail-toggle" type="button" aria-expanded={showDraftDetails} onclick={() => (showDraftDetails = !showDraftDetails)}><span>{showDraftDetails ? '−' : '+'}</span><div><b>{showDraftDetails ? 'Hide details' : draft.category === 'Place' ? 'Add location, date or destination' : 'Change date, time or destination'}</b><small>{draft.destination} · {draftWhen}</small></div><i aria-hidden="true">{showDraftDetails ? '⌃' : '⌄'}</i></button>
+					{#if draft.destination !== 'List'}<button class="confirmation-detail-toggle" type="button" aria-expanded={showDraftDetails} onclick={() => (showDraftDetails = !showDraftDetails)}><span>{showDraftDetails ? '−' : '+'}</span><div><b>{showDraftDetails ? 'Hide details' : draft.category === 'Place' ? 'Add location, date or destination' : 'Change date, time or destination'}</b><small>{draft.destination} · {draftWhen}</small></div><i aria-hidden="true">{showDraftDetails ? '⌃' : '⌄'}</i></button>{/if}
 
 					{#if showDraftDetails && draft.category === 'Place'}
 						<section class:attached={draft.latitude !== undefined && draft.longitude !== undefined} class="place-handoff-card">
@@ -1614,7 +1807,7 @@
 						</section>
 					{/if}
 
-					{#if showDraftDetails}<div class="routing-card">
+					{#if showDraftDetails && draft.destination !== 'List'}<div class="routing-card">
 						<div class="routing-heading"><div><b>Where should this go?</b><small>Trace inferred an action separately from its category.</small></div><span class={`route-confidence ${(draft.destinationConfidence || 'low').toLowerCase().replace(' ', '-')}`}>{draft.destinationConfidence === 'User selected' ? 'Your choice' : `${draft.destinationConfidence || 'Low'} confidence`}</span></div>
 						<div class="destination-picker" role="group" aria-label="Entry destination">
 							<button class:selected={draft.destination === 'Timeline'} type="button" aria-pressed={draft.destination === 'Timeline'} onclick={() => setDraftDestination('Timeline')}><span>≋</span><b>Timeline</b><small>Keep in Trace</small></button>
@@ -1634,7 +1827,7 @@
 					</div>
 					{/if}
 					{#if draftSaveError}<p class="draft-save-error" role="alert"><span>!</span>{draftSaveError}</p>{/if}
-					<div class="sheet-actions confirmation-actions"><button type="button" disabled={savingDraft} onclick={() => (editing = !editing)}>{editing ? 'Done editing' : 'Edit'}</button><button class="confirm" type="button" disabled={savingDraft} onclick={confirmDraft}>{savingDraft ? 'Saving…' : draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length}` : 'Looks right'}</button></div>
+					<div class="sheet-actions confirmation-actions"><button type="button" disabled={savingDraft} onclick={() => (draft?.destination === 'List' ? dismissDraft() : (editing = !editing))}>{draft.destination === 'List' ? 'Rephrase' : editing ? 'Done editing' : 'Edit'}</button><button class="confirm" type="button" disabled={savingDraft} onclick={confirmDraft}>{savingDraft ? 'Saving…' : draft.destination === 'List' ? `Add ${draft.listItems?.length ?? 0} to list` : draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length}` : 'Looks right'}</button></div>
 				</div>
 			</div>
 		{/if}

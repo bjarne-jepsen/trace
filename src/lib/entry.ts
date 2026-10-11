@@ -1,11 +1,14 @@
 import { addDays, describeSchedule, localDateKey } from './dates';
 
-export type EntryCategory = 'Wellbeing' | 'Reminder' | 'Habit' | 'Place' | 'Social' | 'Note';
+export type EntryCategory = 'Wellbeing' | 'Reminder' | 'Habit' | 'Place' | 'Social' | 'Person' | 'Note' | 'Shopping';
 export type EntryStatus = 'Planned' | 'Completed' | 'Tentative';
 export type ClassificationConfidence = 'High' | 'Medium' | 'Low' | 'User selected';
-export type EntryDestination = 'Timeline' | 'Calendar' | 'Reminder';
+/** "List" holds shopping items. They are kept out of the timeline, which is for things that happen. */
+export type EntryDestination = 'Timeline' | 'Calendar' | 'Reminder' | 'List';
 export type EntrySyncStatus = 'Local' | 'Ready' | 'Synced' | 'Failed';
 export type ExternalProvider = 'Google Calendar' | 'Google Tasks';
+
+export const ENTRY_CATEGORIES: EntryCategory[] = ['Wellbeing', 'Habit', 'Reminder', 'Place', 'Social', 'Person', 'Note', 'Shopping'];
 
 export type EntryDraft = {
 	category: EntryCategory;
@@ -14,6 +17,10 @@ export type EntryDraft = {
 	when: string;
 	transcript: string;
 	people?: string[];
+	/** Who a Person note is about. */
+	person?: string;
+	/** Items understood from one shopping capture; each becomes its own list entry on save. */
+	listItems?: string[];
 	status?: EntryStatus;
 	reminder?: boolean;
 	calendar?: boolean;
@@ -702,14 +709,130 @@ function classifyEntry(text: string): Classification {
 	};
 }
 
+// Shopping only triggers on the first words, so "mangler" or "need" inside a sentence stays where it was.
+const SHOPPING_PATTERNS: RegExp[] = [
+	/^(?:vi\s+|jeg\s+)?mangler\s+(?!at\b|stadig\b|svar\b)(.+)/i,
+	/^(?:skriv|sæt|tilføj)\s+(.+?)\s+på\s+(?:indkøbs)?listen\b/i,
+	/^(?:indkøbsliste|indkøb)\b[:\s]+(.+)/i,
+	/^køb\s+(.+)/i,
+	/^(?:we|i)\s+need\s+(?!to\b)(.+)/i,
+	/^(?:we(?:'re|’re| are)|i(?:'m|’m| am))\s+(?:out of|running low on)\s+(.+)/i,
+	/^(?:out of|ran out of)\s+(.+)/i,
+	/^add\s+(.+?)\s+to\s+(?:the\s+)?(?:shopping\s+)?list\b/i,
+	/^shopping(?:\s+list)?\b[:\s]+(.+)/i,
+	/^buy\s+(.+)/i
+];
+
+/** Item names compare without case, articles or trailing punctuation, so "Mælk" and "noget mælk" are one item. */
+export function shoppingItemKey(item: string) {
+	return item
+		.toLocaleLowerCase('da-DK')
+		.replace(/^(?:some|more|a|an|the|noget|nogle|lidt|mere|en|et|ny|nye)\s+/, '')
+		.replace(/[.!?,;:]+$/, '')
+		.trim();
+}
+
+function shoppingItems(text: string, today: Date) {
+	const schedule = parseSchedule(text, 'Shopping', today);
+	for (const pattern of SHOPPING_PATTERNS) {
+		const match = text.match(pattern);
+		if (!match) continue;
+		// "Køb blomster fredag" has a day attached, so it is a task, not a list item.
+		if (/^(?:køb|buy)\b/i.test(text) && (schedule.date || schedule.time)) return null;
+		const items = match[1]
+			.replace(/\s+(?:til|for|from|fra|at|i|in)\s+(?:netto|føtex|rema|lidl|irma|bilka|meny|aldi|coop|the shop|the store|butikken)\b.*$/i, '')
+			.split(/\s*,\s*|\s+(?:og|and|&)\s+/i)
+			.map((item) =>
+				item
+					.replace(/^(?:some|more|a|an|the|noget|nogle|lidt|mere|en|et)\s+/i, '')
+					.replace(/[.!?;:]+$/, '')
+					.trim()
+			)
+			.filter((item) => item && item.split(/\s+/).length <= 5);
+		const unique = items.filter((item, index) => items.findIndex((other) => shoppingItemKey(other) === shoppingItemKey(item)) === index);
+		return unique.length ? { items: unique.map(capitalize), trigger: text.match(/^\S+(?:\s+\S+)?/)?.[0] ?? '' } : null;
+	}
+	return null;
+}
+
+const NOT_NAMES = new Set([...WEEKDAY_ALIASES.flat(), ...MONTH_ALIASES, 'i', 'jeg', 'vi', 'we', 'the', 'my', 'min', 'mit', 'mine']);
+
+/** A Person note: "Om Anna: …" teaches a name; afterwards a sentence that starts with a known name is enough. */
+function personNote(text: string, knownPeople: string[]) {
+	const punctuated = text.match(/^(?:note\s+)?(?:om|about)\s+([\p{L}][\p{L}'’.-]*(?:\s+[\p{L}][\p{L}'’.-]*)?)\s*[:,–—-]\s*(.+)$/iu);
+	// Without punctuation only a capitalised name counts, so "Om to uger …" stays a date.
+	const spoken = text.match(/^(?:[Nn]ote\s+)?(?:[Oo]m|[Aa]bout)\s+(\p{Lu}[\p{L}'’.-]*)\s+(.+)$/u);
+	const explicit = punctuated || spoken;
+	if (explicit && !NOT_NAMES.has(explicit[1].toLocaleLowerCase('da-DK'))) {
+		return { person: capitalize(explicit[1].trim()), fact: capitalize(explicit[2].trim()), trigger: 'Om …' };
+	}
+	const lower = text.toLocaleLowerCase('da-DK');
+	const known = [...knownPeople]
+		.filter((name) => name.trim().length > 1 && !NOT_NAMES.has(name.toLocaleLowerCase('da-DK')))
+		.sort((left, right) => right.length - left.length)
+		.find((name) => {
+			const key = name.toLocaleLowerCase('da-DK');
+			return lower.startsWith(key) && /^(?:s|'s|’s|')?(?![\p{L}\d])/u.test(lower.slice(key.length));
+		});
+	return known ? { person: known, fact: text, trigger: known } : null;
+}
+
+export type InterpretOptions = {
+	/** Names Trace already knows from earlier entries, so "Anna er allergisk over for nødder" needs no keyword. */
+	knownPeople?: string[];
+};
+
 /**
  * Turns a spoken or typed capture into an editable draft. Deterministic: the same text and the same `now`
  * always give the same draft. Anything that had to be guessed is marked so the confirmation can ask about it.
  */
-export function interpretEntry(transcript: string, now = new Date()): EntryDraft {
+export function interpretEntry(transcript: string, now = new Date(), options: InterpretOptions = {}): EntryDraft {
 	const text = transcript.trim();
 	const today = addDays(now, 0);
 	const todayKey = localDateKey(today);
+	const local = {
+		transcript: text,
+		destinationConfidence: 'High' as const,
+		syncStatus: 'Local' as const,
+		classificationConfidence: 'High' as const,
+		calendar: false,
+		reminder: false
+	};
+
+	const shopping = REMINDER_PATTERN.test(text) ? null : shoppingItems(text, today);
+	if (shopping) {
+		return {
+			...local,
+			category: 'Shopping',
+			title: shopping.items.join(', '),
+			detail: 'Shopping list',
+			when: 'On the list',
+			listItems: shopping.items,
+			destination: 'List',
+			destinationReason: 'Goes on the shopping list',
+			status: 'Planned',
+			classificationReason: `Matched “${shopping.trigger}”`
+		};
+	}
+
+	const note = personNote(text, options.knownPeople ?? []);
+	const calendarLike = /\b(?:middag|frokost|møde|kaffe|dinner|lunch|meeting|coffee|drinks?|fest|party)\b/i.test(text);
+	if (note && (note.trigger === 'Om …' || (!calendarLike && !REMINDER_PATTERN.test(text)))) {
+		// A fact about someone keeps its dates as content ("Annas fødselsdag er 3. maj") and is filed on the day it was said.
+		return {
+			...local,
+			category: 'Person',
+			title: note.fact.length > 60 ? `${note.fact.slice(0, 60).trimEnd()}…` : note.fact,
+			detail: `About ${note.person}`,
+			when: 'Captured',
+			person: note.person,
+			people: [note.person],
+			destination: 'Timeline',
+			destinationReason: 'A note about someone you know',
+			classificationReason: note.trigger === 'Om …' ? `Matched “Om ${note.person}”` : `Starts with “${note.person}”, someone you know`
+		};
+	}
+
 	const classification = classifyEntry(text);
 	const schedule = parseSchedule(text, classification.category, today);
 	// A resolved date decides the tense. Verb cues only decide when the entry is dated today or not dated at all.
