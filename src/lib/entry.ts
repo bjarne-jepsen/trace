@@ -711,15 +711,15 @@ function classifyEntry(text: string): Classification {
 
 // Shopping only triggers on the first words, so "mangler" or "need" inside a sentence stays where it was.
 const SHOPPING_PATTERNS: RegExp[] = [
-	/^(?:vi\s+|jeg\s+)?mangler\s+(?!at\b|stadig\b|svar\b)(.+)/i,
+	/^(?:vi\s+|jeg\s+)?mangler[:\s]+(?!at\b|stadig\b|svar\b)(.+)/is,
 	/^(?:skriv|sæt|tilføj)\s+(.+?)\s+på\s+(?:indkøbs)?listen\b/i,
-	/^(?:indkøbsliste|indkøb)\b[:\s]+(.+)/i,
+	/^(?:indkøbsliste|indkøb)\b[:\s]+(.+)/is,
 	/^køb\s+(.+)/i,
-	/^(?:we|i)\s+need\s+(?!to\b)(.+)/i,
+	/^(?:we|i)\s+need\s+(?!to\b)(.+)/is,
 	/^(?:we(?:'re|’re| are)|i(?:'m|’m| am))\s+(?:out of|running low on)\s+(.+)/i,
-	/^(?:out of|ran out of)\s+(.+)/i,
+	/^(?:out of|ran out of)\s+(.+)/is,
 	/^add\s+(.+?)\s+to\s+(?:the\s+)?(?:shopping\s+)?list\b/i,
-	/^shopping(?:\s+list)?\b[:\s]+(.+)/i,
+	/^shopping(?:\s+list)?\b[:\s]+(.+)/is,
 	/^buy\s+(.+)/i
 ];
 
@@ -732,6 +732,18 @@ export function shoppingItemKey(item: string) {
 		.trim();
 }
 
+/** Dictation often drops the commas ("mælk æg kaffe"). Plain words with no quantity or article are split apart. */
+function splitUnpunctuatedItems(chunk: string) {
+	const words = chunk.trim().split(/\s+/);
+	const plain = words.every((word) => /^\p{L}+$/u.test(word) && !SHOPPING_GLUE.has(word.toLocaleLowerCase('da-DK')));
+	return words.length >= 3 && plain ? words : [chunk];
+}
+
+const SHOPPING_GLUE = new Set([
+	'some', 'more', 'a', 'an', 'the', 'of', 'with', 'for', 'to', 'noget', 'nogle', 'lidt', 'mere', 'en', 'et', 'ny', 'nye',
+	'af', 'med', 'til', 'for', 'liter', 'pakke', 'pakker', 'dåse', 'dåser', 'flaske', 'flasker', 'stk', 'kg', 'gram'
+]);
+
 function shoppingItems(text: string, today: Date) {
 	const schedule = parseSchedule(text, 'Shopping', today);
 	for (const pattern of SHOPPING_PATTERNS) {
@@ -741,7 +753,8 @@ function shoppingItems(text: string, today: Date) {
 		if (/^(?:køb|buy)\b/i.test(text) && (schedule.date || schedule.time)) return null;
 		const items = match[1]
 			.replace(/\s+(?:til|for|from|fra|at|i|in)\s+(?:netto|føtex|rema|lidl|irma|bilka|meny|aldi|coop|the shop|the store|butikken)\b.*$/i, '')
-			.split(/\s*,\s*|\s+(?:og|and|&)\s+/i)
+			.split(/\s*[,;\n]\s*|\s*\.\s+|\s+(?:og|and|&)\s+/i)
+			.flatMap(splitUnpunctuatedItems)
 			.map((item) =>
 				item
 					.replace(/^(?:some|more|a|an|the|noget|nogle|lidt|mere|en|et)\s+/i, '')

@@ -302,6 +302,14 @@ describe('shopping list', () => {
 		expect(entry.listItems).toEqual(['Mælk', 'Æg', 'Kaffe']);
 	});
 
+	test('splits dictated lists without commas, and lists with colons, periods or line breaks', () => {
+		expect(read('Mangler mælk æg kaffe og smør').listItems).toEqual(['Mælk', 'Æg', 'Kaffe', 'Smør']);
+		expect(read('Mangler: mælk, æg').listItems).toEqual(['Mælk', 'Æg']);
+		expect(read('Mangler mælk. Æg. Kaffe.').listItems).toEqual(['Mælk', 'Æg', 'Kaffe']);
+		expect(read('Mangler\nmælk\næg').listItems).toEqual(['Mælk', 'Æg']);
+		expect(read('Mangler 2 liter mælk og en pakke kaffe').listItems).toEqual(['2 liter mælk', 'Pakke kaffe']);
+	});
+
 	test('understands English and list phrasing, and drops articles', () => {
 		expect(read('We need milk and bread').listItems).toEqual(['Milk', 'Bread']);
 		expect(read('Vi mangler noget toiletpapir').listItems).toEqual(['Toiletpapir']);
