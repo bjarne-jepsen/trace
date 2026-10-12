@@ -96,8 +96,8 @@ select {
 	position: sticky;
 	top: 0;
 	display: grid;
-	grid-template-columns: repeat(4, 1fr);
-	gap: 6px;
+	grid-template-columns: repeat(3, 1fr);
+	gap: 7px;
 	padding: 12px 22px;
 	border-bottom: 1px solid var(--line);
 	background: rgba(245, 243, 236, 0.94);
@@ -965,3 +965,30 @@ select {
 .command-settings form button { min-height: 44px; padding: 0 14px; border: 0; border-radius: 11px; background: var(--ink); color: var(--paper); font-size: 0.875rem; font-weight: 700; }
 .command-settings .data-message { margin-top: 8px; }
 .command-reset { margin-top: 8px; padding: 6px 0; border: 0; background: transparent; color: var(--muted-strong); font-size: 0.8125rem; text-decoration: underline; }
+
+/* Ask Trace */
+.answer-card { margin-top: 16px; padding: 16px; border: 1px solid var(--line); border-radius: 18px; background: #fbfaf5; }
+.answer-question { margin: 0 0 6px; color: var(--muted); font-size: 0.8125rem; }
+.answer-card h3 { margin: 0; font-size: 1.125rem; line-height: 1.35; letter-spacing: -0.02em; }
+.answer-note { margin: 8px 0 0; color: #6e5a1c; font-size: 0.75rem; }
+.answer-card ul { display: grid; margin: 14px 0 0; padding: 0; list-style: none; border-top: 1px solid var(--line); }
+.answer-card li { border-bottom: 1px solid var(--line); }
+.answer-card li > button {
+	display: grid;
+	width: 100%;
+	grid-template-columns: minmax(0, 1fr) auto;
+	padding: 10px 0;
+	gap: 2px 10px;
+	border: 0;
+	background: transparent;
+	color: var(--ink);
+	text-align: left;
+}
+.answer-card li time { grid-column: 1 / -1; color: var(--muted); font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 0.6875rem; text-transform: uppercase; }
+.answer-card li span { font-size: 0.875rem; line-height: 1.35; }
+.answer-card li b { font-size: 0.8125rem; }
+.answer-card li .place-map-actions { margin: 0 0 10px !important; }
+.answer-link { margin-top: 12px; padding: 0; border: 0; background: transparent; color: #4c6b1f; font-size: 0.875rem; font-weight: 700; }
+.answer-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 16px; }
+.answer-actions button { min-height: 44px; padding: 8px; border: 1px solid var(--line); border-radius: 12px; background: #f0eee6; color: var(--ink); font-size: 0.8125rem; font-weight: 700; }
+.answer-actions button:first-child { border: 0; background: var(--ink); color: var(--paper); }

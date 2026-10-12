@@ -20,6 +20,7 @@
 		type CommandCategory,
 		type CommandWord
 	} from '$lib/commands';
+	import { answerQuestion, detectQuestion, type Answer } from '$lib/ask';
 	import { TIMELINE_CATEGORIES, entryCaptureDateKey, entryDateKey, wellbeingScoreOf } from '$lib/timeline';
 
 	type CaptureState = 'idle' | 'requesting' | 'listening' | 'processing';
@@ -122,6 +123,8 @@
 	let newCommandWord = $state('');
 	let newCommandCategory = $state<CommandCategory>('Wellbeing');
 	let commandError = $state('');
+	let answer = $state<Answer | null>(null);
+	let askedText = $state('');
 	let editInterpretationMessage = $state('');
 	let draftTimeConfirmed = $state(false);
 	let editError = $state('');
@@ -159,7 +162,7 @@
 		captureState === 'requesting' ? 'Opening microphone…' :
 		captureState === 'listening' ? 'Listening… tap when done' :
 		captureState === 'processing' ? 'Finishing capture…' :
-		'Tap once, then speak naturally'
+		'Tap once, then speak or ask a question'
 	);
 	// Shopping items are a list, not things that happen, so every timeline view works on traces.
 	const traces = $derived(timeline.filter((entry) => entry.destination !== 'List'));
@@ -451,6 +454,11 @@
 		}
 		liveTranscript = cleaned;
 		draftSaveError = '';
+		if (askTrace(cleaned)) {
+			captureState = 'idle';
+			liveTranscript = '';
+			return;
+		}
 		captureState = 'processing';
 		draft = interpretEntry(cleaned, new Date(), { knownPeople, commands });
 		showDraftDetails = false;
@@ -595,7 +603,52 @@
 		liveTranscript = '';
 		captureOpen = false;
 		captureMessage = '';
+		answer = null;
+		askedText = '';
 		window.setTimeout(() => (finishing = false), 200);
+	}
+
+	/** Questions go to Ask Trace instead of becoming a new trace. */
+	function askTrace(text: string) {
+		const question = detectQuestion(text);
+		if (!question) return false;
+		refreshToday();
+		askedText = text;
+		answer = answerQuestion(question, timeline, todayKey);
+		draft = null;
+		haptic(8);
+		return true;
+	}
+
+	function clearAnswer() {
+		answer = null;
+		askedText = '';
+		if (showManual) window.requestAnimationFrame(() => manualInput?.focus());
+	}
+
+	// The escape hatch when a capture was read as a question.
+	function saveQuestionAsTrace() {
+		const text = askedText;
+		answer = null;
+		askedText = '';
+		draft = interpretEntry(text, new Date(), { knownPeople, commands });
+		showDraftDetails = false;
+		draftTimeConfirmed = Boolean(draft.scheduledTime);
+	}
+
+	function openAnswerEntry(entry: TimelineEntry) {
+		answer = null;
+		askedText = '';
+		captureOpen = false;
+		beginEntryEdit(entry);
+	}
+
+	function openShoppingFromAnswer() {
+		answer = null;
+		askedText = '';
+		captureOpen = false;
+		activeTab = 'upcoming';
+		window.scrollTo({ top: 0 });
 	}
 
 	function setCaptureMethod(method: 'voice' | 'type') {
@@ -637,7 +690,7 @@
 
 	function commandHint(category: CommandCategory) {
 		const meaning = commandNumberMeaning(category);
-		return meaning === 'score' ? 'a number is the 0–10 score' : meaning === 'minutes' ? 'a number is minutes' : '';
+		return meaning === 'score' ? 'number = score' : meaning === 'minutes' ? 'number = minutes' : '';
 	}
 
 	function startRepeatCapture(prompt: string) {
@@ -657,6 +710,7 @@
 		captureMessage = '';
 		draftSaveError = '';
 		showManual = keepTypedCapture;
+		if (askTrace(value)) return;
 		liveTranscript = value;
 		captureState = 'processing';
 		draft = interpretEntry(value, new Date(), { knownPeople, commands });
@@ -1502,12 +1556,28 @@
 			<div><button type="button" class:active={captureLanguage === 'da-DK'} onclick={() => setCaptureLanguage('da-DK')} disabled={captureState !== 'idle'} aria-pressed={captureLanguage === 'da-DK'}>Dansk</button><button type="button" class:active={captureLanguage === 'en-US'} onclick={() => setCaptureLanguage('en-US')} disabled={captureState !== 'idle'} aria-pressed={captureLanguage === 'en-US'}>English</button></div>
 		</div>
 
+		{#if answer}
+			<section class="answer-card" aria-live="polite" aria-label="Answer from your traces">
+				<p class="answer-question">“{askedText}”</p>
+				<h3>{answer.summary}</h3>
+				{#if answer.partial}<p class="answer-note">No trace matched every word. These are the closest.</p>{/if}
+				{#if answer.entries.length}
+					<ul>
+						{#each answer.entries as entry (entry.id)}
+							<li><button type="button" onclick={() => openAnswerEntry(entry)}><time>{relativeDayLabel(entryDateKey(entry), todayKey)}{entry.scheduledTime ? ` · ${formatClockTime(entry.scheduledTime)}` : ''}</time><span>{entry.transcript}</span>{#if wellbeingScoreOf(entry) !== undefined}<b>{wellbeingScoreOf(entry)} / 10</b>{/if}</button>{@render placeLinks(entry)}</li>
+						{/each}
+					</ul>
+				{/if}
+				{#if answer.shopping?.length}<button class="answer-link" type="button" onclick={openShoppingFromAnswer}>Open the shopping list →</button>{/if}
+				<div class="answer-actions"><button type="button" onclick={clearAnswer}>Ask or capture again</button><button type="button" onclick={saveQuestionAsTrace}>Save as a trace instead</button></div>
+			</section>
+		{:else}
 		<section class:listening={captureState === 'listening'} class:typing={showManual} class="capture-card" aria-live="polite">
 			<div class="ambient ambient-one"></div><div class="ambient ambient-two"></div>
 			{#if showManual}
 				<form class="typed-capture" onsubmit={submitManual}>
-					<div class="capture-readout"><span>Type or dictate</span><p>Write naturally, or tap the microphone on your keyboard.</p></div>
-					<label for="manual-text">What would you like to capture?</label>
+					<div class="capture-readout"><span>Type or dictate</span><p>Write naturally, or ask: “Hvornår var jeg sidst hos tandlægen?”</p></div>
+					<label for="manual-text">Capture something, or ask a question</label>
 					<textarea id="manual-text" bind:this={manualInput} bind:value={manualText} rows="5" placeholder="Type here, or use your keyboard microphone…" disabled={captureState === 'processing'}></textarea>
 					<div class="typed-capture-actions"><small>You can review everything before it is saved.</small><button type="submit" disabled={!manualText.trim() || captureState === 'processing'}>{#if captureState === 'processing'}<span class="spinner light"></span>{:else}Interpret <span aria-hidden="true">→</span>{/if}</button></div>
 				</form>
@@ -1527,6 +1597,7 @@
 			{/if}
 		</section>
 
+		{/if}
 		{#if captureMessage}
 			<div class="capture-feedback">
 				<p class="capture-message">{captureMessage}</p>
@@ -1537,7 +1608,7 @@
 				{/if}
 			</div>
 		{/if}
-		{#if commands.length}
+		{#if commands.length && !answer}
 			<div class="repeat-captures" aria-label="Start with a command word">
 				<div><span>Command words</span><small>Start with one to choose the category</small></div>
 				<div>{#each commands as command (command.word)}<button type="button" onclick={() => startRepeatCapture(`${command.word} `)}><span aria-hidden="true">{categorySymbols[command.category]}</span>{command.word}</button>{/each}</div>
