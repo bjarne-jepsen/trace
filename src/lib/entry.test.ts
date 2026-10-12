@@ -370,3 +370,74 @@ describe('social plans', () => {
 		expect(read('Dinner with Tom yesterday').status).toBeUndefined();
 	});
 });
+
+describe('command words', () => {
+	const commands = [
+		{ word: 'Tinnitus', category: 'Wellbeing' },
+		{ word: 'Løb', category: 'Habit' },
+		{ word: 'Note', category: 'Note' },
+		{ word: 'Sted', category: 'Place' },
+		{ word: 'Indkøb', category: 'Shopping' },
+		{ word: 'Opgave', category: 'Reminder' },
+		{ word: 'God morgen', category: 'Wellbeing' }
+	];
+	const command = (text: string) => interpretEntry(text, WEDNESDAY, { commands });
+
+	test('a bare number after a wellbeing word is the score', () => {
+		const entry = command('Tinnitus 6');
+		expect(entry.category).toBe('Wellbeing');
+		expect(entry.title).toBe('Tinnitus');
+		expect(entry.wellbeingScore).toBe(6);
+		expect(entry.detail).toBe('6 / 10');
+		expect(entry.classificationConfidence).toBe('High');
+		expect(command('Tinnitus: syv, værre end i går').wellbeingScore).toBe(7);
+		expect(command('Tinnitus 6.5').scheduledDate).toBeUndefined();
+	});
+
+	test('without a number the score stays empty', () => {
+		const entry = command('Tinnitus en smule højere');
+		expect(entry.wellbeingScore).toBeUndefined();
+		expect(entry.detail).toBe('Tinnitus noted');
+	});
+
+	test('a bare number after an activity word is minutes, and a day makes it a plan', () => {
+		const done = command('Løb 35');
+		expect(done.category).toBe('Habit');
+		expect(done.activityMinutes).toBe(35);
+		expect(done.detail).toBe('35 minutes');
+		expect(done.destination).toBe('Timeline');
+		const planned = command('Løb 45 i morgen');
+		expect(planned.destination).toBe('Calendar');
+		expect(planned.scheduledDate).toBe('2026-10-01');
+		expect(planned.durationMinutes).toBe(45);
+		expect(command('Løb en time').activityMinutes).toBe(60);
+	});
+
+	test('a note keeps its text and ignores dates inside it', () => {
+		const entry = command('Note idé til haven på fredag');
+		expect(entry.category).toBe('Note');
+		expect(entry.title).toBe('Idé til haven på fredag');
+		expect(entry.scheduledDate).toBeUndefined();
+	});
+
+	test('other categories use the rest of the sentence', () => {
+		expect(command('Sted Café Dyrehaven på Vesterbro').title).toBe('Café Dyrehaven på Vesterbro');
+		expect(command('Indkøb mælk og æg').listItems).toEqual(['Mælk', 'Æg']);
+		const task = command('Opgave ring til banken fredag');
+		expect(task.category).toBe('Reminder');
+		expect(task.title).toBe('Ring til banken');
+		expect(task.scheduledDate).toBe('2026-10-02');
+		expect(task.transcript).toBe('Opgave ring til banken fredag');
+	});
+
+	test('only counts as the first word, and multi-word commands work', () => {
+		expect(command('Min tinnitus er 6 ud af 10').title).toBe('Tinnitus');
+		expect(command('Min tinnitus er 6 ud af 10').classificationReason).not.toContain('Command');
+		expect(command('Løbetur i skoven').classificationReason).not.toContain('Command');
+		expect(command('God morgen 8').wellbeingScore).toBe(8);
+	});
+
+	test('"Om Anna:" still beats a command word', () => {
+		expect(interpretEntry('Note om Anna: elsker jazz', WEDNESDAY, { commands }).category).toBe('Person');
+	});
+});

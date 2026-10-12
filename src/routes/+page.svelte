@@ -11,6 +11,15 @@
 	} from '$lib/entry';
 	import { deleteLocalEntry, listLocalEntries, saveLocalEntries, saveLocalEntry } from '$lib/local-entries';
 	import { dateKeyAfter, describeSchedule, localDateKey, parseDateKey, relativeDayLabel } from '$lib/dates';
+	import {
+		COMMAND_CATEGORIES,
+		DEFAULT_COMMANDS,
+		commandNumberMeaning,
+		commandProblem,
+		normalizeCommands,
+		type CommandCategory,
+		type CommandWord
+	} from '$lib/commands';
 	import { TIMELINE_CATEGORIES, entryCaptureDateKey, entryDateKey, wellbeingScoreOf } from '$lib/timeline';
 
 	type CaptureState = 'idle' | 'requesting' | 'listening' | 'processing';
@@ -33,6 +42,7 @@
 		version: 1;
 		exportedAt: string;
 		entries: TimelineEntry[];
+		commands?: CommandWord[];
 	};
 	type PlaceLocationTarget = 'draft' | 'edit';
 	type PlaceLocationState = 'idle' | 'requesting' | 'attached' | 'error';
@@ -78,12 +88,16 @@
 		'6 / 10 · Noticeable',
 		'8 / 10 · Intense'
 	]);
-	const repeatCaptures = [
-		{ label: 'Tinnitus', symbol: '◎', prompt: 'My tinnitus feels ' },
-		{ label: 'Training', symbol: '↗', prompt: 'I trained for ' },
-		{ label: 'Wellbeing', symbol: '♡', prompt: 'Today my wellbeing is ' },
-		{ label: 'Reminder', symbol: '!', prompt: 'Remind me to ' }
-	];
+	const COMMANDS_KEY = 'trace-commands';
+	const categorySymbols: Record<CommandCategory, string> = {
+		Wellbeing: '◎',
+		Habit: '↗',
+		Reminder: '!',
+		Social: '☺',
+		Place: '⌖',
+		Note: '≋',
+		Shopping: '✓'
+	};
 
 	let captureState = $state<CaptureState>('idle');
 	let captureOpen = $state(false);
@@ -104,6 +118,10 @@
 	let editingEntry = $state<TimelineEntry | null>(null);
 	let editingPeople = $state('');
 	let editingScore = $state('');
+	let commands = $state<CommandWord[]>(DEFAULT_COMMANDS);
+	let newCommandWord = $state('');
+	let newCommandCategory = $state<CommandCategory>('Wellbeing');
+	let commandError = $state('');
 	let editInterpretationMessage = $state('');
 	let draftTimeConfirmed = $state(false);
 	let editError = $state('');
@@ -328,6 +346,11 @@
 
 	onMount(() => {
 		lastBackupAt = window.localStorage.getItem('trace-last-backup-at') || '';
+		try {
+			commands = normalizeCommands(JSON.parse(window.localStorage.getItem(COMMANDS_KEY) || 'null')) ?? DEFAULT_COMMANDS;
+		} catch {
+			commands = DEFAULT_COMMANDS;
+		}
 		showManual = window.localStorage.getItem('trace-capture-method') === 'type';
 		const storedLanguage = window.localStorage.getItem('trace-capture-language');
 		captureLanguage = storedLanguage === 'en-US' || storedLanguage === 'da-DK'
@@ -340,12 +363,14 @@
 		if (captureMode === 'voice') showManual = false;
 		if (captureMode) captureOpen = true;
 		if (checkin) {
-			const selected = repeatCaptures.find((item) => item.label.toLocaleLowerCase() === checkin.toLocaleLowerCase());
-			if (selected) {
-				showManual = true;
-				manualText = selected.prompt;
-				captureOpen = true;
-			}
+			// The home-screen shortcut asks for "wellbeing"; any command word works too.
+			const wanted = checkin.toLocaleLowerCase('da-DK');
+			const selected =
+				commands.find((command) => command.word.toLocaleLowerCase('da-DK') === wanted) ??
+				(wanted === 'wellbeing' ? commands.find((command) => command.category === 'Wellbeing') : undefined);
+			showManual = true;
+			manualText = selected ? `${selected.word} ` : '';
+			captureOpen = true;
 		}
 		if (launch.search) window.history.replaceState(null, '', window.location.pathname);
 		window.requestAnimationFrame(() => {
@@ -427,7 +452,7 @@
 		liveTranscript = cleaned;
 		draftSaveError = '';
 		captureState = 'processing';
-		draft = interpretEntry(cleaned, new Date(), { knownPeople });
+		draft = interpretEntry(cleaned, new Date(), { knownPeople, commands });
 		showDraftDetails = false;
 		draftTimeConfirmed = Boolean(draft.scheduledTime);
 		placeLocationState = 'idle';
@@ -587,6 +612,34 @@
 		window.localStorage.setItem('trace-capture-language', language);
 	}
 
+	function saveCommands(next: CommandWord[]) {
+		commands = next;
+		window.localStorage.setItem(COMMANDS_KEY, JSON.stringify(next));
+	}
+
+	function addCommand(event: SubmitEvent) {
+		event.preventDefault();
+		commandError = commandProblem(newCommandWord, commands);
+		if (commandError) return;
+		saveCommands([...commands, { word: newCommandWord.trim(), category: newCommandCategory }]);
+		newCommandWord = '';
+	}
+
+	function removeCommand(word: string) {
+		saveCommands(commands.filter((command) => command.word !== word));
+		commandError = '';
+	}
+
+	function restoreDefaultCommands() {
+		saveCommands([...DEFAULT_COMMANDS]);
+		commandError = '';
+	}
+
+	function commandHint(category: CommandCategory) {
+		const meaning = commandNumberMeaning(category);
+		return meaning === 'score' ? 'a number is the 0–10 score' : meaning === 'minutes' ? 'a number is minutes' : '';
+	}
+
 	function startRepeatCapture(prompt: string) {
 		if (captureState !== 'idle') return;
 		captureOpen = true;
@@ -606,7 +659,7 @@
 		showManual = keepTypedCapture;
 		liveTranscript = value;
 		captureState = 'processing';
-		draft = interpretEntry(value, new Date(), { knownPeople });
+		draft = interpretEntry(value, new Date(), { knownPeople, commands });
 		showDraftDetails = false;
 		draftTimeConfirmed = Boolean(draft.scheduledTime);
 		placeLocationState = 'idle';
@@ -981,7 +1034,8 @@
 			app: 'Trace',
 			version: 1,
 			exportedAt,
-			entries: timeline
+			entries: timeline,
+			commands
 		};
 		const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
 		const url = URL.createObjectURL(blob);
@@ -1022,7 +1076,11 @@
 			}
 			await saveLocalEntries(candidate);
 			timeline = await listLocalEntries();
-			backupMessage = `${candidate.length} ${candidate.length === 1 ? 'entry' : 'entries'} merged into this device.`;
+			// Command words from the backup are added; words already here keep their current category.
+			const restoredCommands = Array.isArray(parsed) ? null : normalizeCommands((parsed as { commands?: unknown }).commands);
+			const addedCommands = (restoredCommands ?? []).filter((command) => !commandProblem(command.word, commands));
+			if (addedCommands.length) saveCommands([...commands, ...addedCommands]);
+			backupMessage = `${candidate.length} ${candidate.length === 1 ? 'entry' : 'entries'} merged into this device${addedCommands.length ? `, plus ${addedCommands.length} command ${addedCommands.length === 1 ? 'word' : 'words'}` : ''}.`;
 		} catch {
 			backupError = 'Trace could not read that backup. Choose an unmodified Trace JSON backup.';
 		} finally {
@@ -1240,7 +1298,7 @@
 	function reinterpretEditedCapture() {
 		if (!editingEntry?.transcript.trim()) return;
 		const current = editingEntry;
-		const interpreted = interpretEntry(current.transcript.trim(), new Date(), { knownPeople });
+		const interpreted = interpretEntry(current.transcript.trim(), new Date(), { knownPeople, commands });
 		const occurrenceDate = interpreted.scheduledDates?.[current.occurrenceIndex || 0] || interpreted.scheduledDate;
 		const { scheduledDates: _scheduledDates, ...singleOccurrence } = interpreted;
 		editingEntry = {
@@ -1479,10 +1537,12 @@
 				{/if}
 			</div>
 		{/if}
-		<div class="repeat-captures" aria-label="Repeat a common capture">
-			<div><span>Capture again</span><small>Start with something familiar</small></div>
-			<div>{#each repeatCaptures as item}<button type="button" onclick={() => startRepeatCapture(item.prompt)}><span aria-hidden="true">{item.symbol}</span>{item.label}</button>{/each}</div>
-		</div>
+		{#if commands.length}
+			<div class="repeat-captures" aria-label="Start with a command word">
+				<div><span>Command words</span><small>Start with one to choose the category</small></div>
+				<div>{#each commands as command (command.word)}<button type="button" onclick={() => startRepeatCapture(`${command.word} `)}><span aria-hidden="true">{categorySymbols[command.category]}</span>{command.word}</button>{/each}</div>
+			</div>
+		{/if}
 			</section>
 		</div>
 		{/if}
@@ -1596,7 +1656,7 @@
 			<div class="sheet-backdrop" role="presentation">
 				<div class="data-tools-sheet" role="dialog" aria-modal="true" aria-labelledby="data-tools-title">
 					<div class="sheet-handle"></div>
-					<div class="sheet-heading"><div><span class="data-tools-symbol">↧</span><div><p>Device-local storage</p><h2 id="data-tools-title">Your Trace data</h2></div></div><button type="button" onclick={() => (showDataTools = false)} aria-label="Close data tools">×</button></div>
+					<div class="sheet-heading"><div><span class="data-tools-symbol">↧</span><div><p>Stored on this device</p><h2 id="data-tools-title">Settings and data</h2></div></div><button type="button" onclick={() => (showDataTools = false)} aria-label="Close data tools">×</button></div>
 					<div class="data-summary"><article><span>Entries</span><strong>{timeline.length}</strong></article><article><span>Storage</span><strong>This device</strong>{#if storagePersisted !== null}<small>{storagePersisted ? 'Protected from automatic clean-up' : 'Chrome may clear it if space runs low'}</small>{/if}</article></div>
 					<div class="backup-status"><span class:ready={Boolean(lastBackupAt)}>{lastBackupAt ? '✓' : '!'}</span><div><b>{formatLastBackup()}</b><small>A backup protects your timeline if Chrome’s site data is cleared.</small></div></div>
 					<div class="data-actions">
@@ -1604,6 +1664,24 @@
 						<label class:disabled={restoringBackup}><span>↑</span><div><b>{restoringBackup ? 'Restoring…' : 'Restore backup'}</b><small>Merge a previous Trace backup into this device</small></div><input type="file" accept="application/json,.json" disabled={restoringBackup} onchange={restoreBackup} /></label>
 					</div>
 					<p class="merge-note"><span>i</span>Restore never deletes current entries. Matching IDs are updated and everything else is merged.</p>
+					<section class="command-settings" aria-labelledby="command-settings-title">
+						<h3 id="command-settings-title">Command words</h3>
+						<p>Start a capture with one of these words and Trace uses its category without guessing. “Tinnitus 6” saves a score of 6, “Løb 35” saves 35 minutes.</p>
+						<ul>
+							{#each commands as command (command.word)}
+								<li><span class={`category-dot ${command.category.toLowerCase()}`}></span><b>{command.word}</b><small>{command.category}{commandHint(command.category) ? ` · ${commandHint(command.category)}` : ''}</small><button type="button" onclick={() => removeCommand(command.word)} aria-label={`Remove the command word ${command.word}`}>×</button></li>
+							{:else}
+								<li class="empty">No command words. Trace guesses the category from the whole sentence.</li>
+							{/each}
+						</ul>
+						<form onsubmit={addCommand}>
+							<input bind:value={newCommandWord} placeholder="New word, e.g. Medicin" aria-label="New command word" oninput={() => (commandError = '')} />
+							<select bind:value={newCommandCategory} aria-label="Category for the new command word">{#each COMMAND_CATEGORIES as category}<option value={category}>{category}</option>{/each}</select>
+							<button type="submit">Add</button>
+						</form>
+						{#if commandError}<p class="data-message error" role="alert"><span>!</span>{commandError}</p>{/if}
+						<button class="command-reset" type="button" onclick={restoreDefaultCommands}>Restore the default words</button>
+					</section>
 					{#if backupMessage}<p class="data-message success" role="status"><span>✓</span>{backupMessage}</p>{/if}
 					{#if backupError}<p class="data-message error" role="alert"><span>!</span>{backupError}</p>{/if}
 					<button class="data-done" type="button" onclick={() => (showDataTools = false)}>Done</button>

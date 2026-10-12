@@ -937,3 +937,31 @@ select {
 	font-size: 0.875rem;
 	font-weight: 600;
 }
+
+/* Command words in settings */
+.command-settings { margin: 18px 0 14px; padding-top: 16px; border-top: 1px solid var(--line); }
+.command-settings h3 { margin: 0 0 4px; font-size: 1rem; letter-spacing: -0.02em; }
+.command-settings > p { margin: 0 0 10px; color: var(--muted); font-size: 0.8125rem; line-height: 1.45; }
+.command-settings ul { display: grid; margin: 0 0 10px; padding: 0; list-style: none; border: 1px solid var(--line); border-radius: 14px; background: #fff; }
+.command-settings li { display: grid; grid-template-columns: 10px auto minmax(0, 1fr) 36px; min-height: 46px; padding: 0 4px 0 12px; align-items: center; gap: 9px; }
+.command-settings li + li { border-top: 1px solid var(--line); }
+.command-settings li .category-dot { margin: 0; }
+.command-settings li b { font-size: 0.875rem; }
+.command-settings li small { overflow: hidden; color: var(--muted); font-size: 0.75rem; text-overflow: ellipsis; white-space: nowrap; }
+.command-settings li button { width: 36px; height: 36px; border: 0; border-radius: 50%; background: transparent; color: var(--muted); font-size: 1.125rem; }
+.command-settings li.empty { display: block; padding: 12px; color: var(--muted); font-size: 0.8125rem; }
+.command-settings form { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 6px; }
+.command-settings input,
+.command-settings select {
+	min-width: 0;
+	min-height: 44px;
+	padding: 8px 10px;
+	border: 1px solid var(--line);
+	border-radius: 11px;
+	background: #fff;
+	color: var(--ink);
+	font-size: 0.875rem;
+}
+.command-settings form button { min-height: 44px; padding: 0 14px; border: 0; border-radius: 11px; background: var(--ink); color: var(--paper); font-size: 0.875rem; font-weight: 700; }
+.command-settings .data-message { margin-top: 8px; }
+.command-reset { margin-top: 8px; padding: 6px 0; border: 0; background: transparent; color: var(--muted-strong); font-size: 0.8125rem; text-decoration: underline; }

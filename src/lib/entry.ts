@@ -1,3 +1,4 @@
+import { commandNumberMeaning, matchCommand, type CommandWord } from './commands';
 import { addDays, describeSchedule, localDateKey } from './dates';
 
 export type EntryCategory = 'Wellbeing' | 'Reminder' | 'Habit' | 'Place' | 'Social' | 'Person' | 'Note' | 'Shopping';
@@ -751,21 +752,27 @@ function shoppingItems(text: string, today: Date) {
 		if (!match) continue;
 		// "Køb blomster fredag" has a day attached, so it is a task, not a list item.
 		if (/^(?:køb|buy)\b/i.test(text) && (schedule.date || schedule.time)) return null;
-		const items = match[1]
-			.replace(/\s+(?:til|for|from|fra|at|i|in)\s+(?:netto|føtex|rema|lidl|irma|bilka|meny|aldi|coop|the shop|the store|butikken)\b.*$/i, '')
-			.split(/\s*[,;\n]\s*|\s*\.\s+|\s+(?:og|and|&)\s+/i)
-			.flatMap(splitUnpunctuatedItems)
-			.map((item) =>
-				item
-					.replace(/^(?:some|more|a|an|the|noget|nogle|lidt|mere|en|et)\s+/i, '')
-					.replace(/[.!?;:]+$/, '')
-					.trim()
-			)
-			.filter((item) => item && item.split(/\s+/).length <= 5);
-		const unique = items.filter((item, index) => items.findIndex((other) => shoppingItemKey(other) === shoppingItemKey(item)) === index);
-		return unique.length ? { items: unique.map(capitalize), trigger: text.match(/^\S+(?:\s+\S+)?/)?.[0] ?? '' } : null;
+		const items = splitShoppingItems(match[1]);
+		return items.length ? { items, trigger: text.match(/^\S+(?:\s+\S+)?/)?.[0] ?? '' } : null;
 	}
 	return null;
+}
+
+function splitShoppingItems(raw: string) {
+	const items = raw
+		.replace(/\s+(?:til|for|from|fra|at|i|in)\s+(?:netto|føtex|rema|lidl|irma|bilka|meny|aldi|coop|the shop|the store|butikken)\b.*$/i, '')
+		.split(/\s*[,;\n]\s*|\s*\.\s+|\s+(?:og|and|&)\s+/i)
+		.flatMap(splitUnpunctuatedItems)
+		.map((item) =>
+			item
+				.replace(/^(?:some|more|a|an|the|noget|nogle|lidt|mere|en|et)\s+/i, '')
+				.replace(/[.!?;:]+$/, '')
+				.trim()
+		)
+		.filter((item) => item && item.split(/\s+/).length <= 5);
+	return items
+		.filter((item, index) => items.findIndex((other) => shoppingItemKey(other) === shoppingItemKey(item)) === index)
+		.map(capitalize);
 }
 
 const NOT_NAMES = new Set([...WEEKDAY_ALIASES.flat(), ...MONTH_ALIASES, 'i', 'jeg', 'vi', 'we', 'the', 'my', 'min', 'mit', 'mine']);
@@ -793,7 +800,15 @@ function personNote(text: string, knownPeople: string[]) {
 export type InterpretOptions = {
 	/** Names Trace already knows from earlier entries, so "Anna er allergisk over for nødder" needs no keyword. */
 	knownPeople?: string[];
+	/** The user's command words. The first word of a capture picks the category without any guessing. */
+	commands?: CommandWord[];
 };
+
+// Articles and "to" read as numbers elsewhere ("en uge"), but after a command word they are ordinary words.
+const COMMAND_NUMBER = new RegExp(
+	`^(\\d+(?:[.,]\\d+)?|${alternation(Object.keys(NUMBER_WORDS).filter((word) => !['a', 'an', 'en', 'et', 'to'].includes(word)))})(?![\\p{L}\\d])`,
+	'iu'
+);
 
 /**
  * Turns a spoken or typed capture into an editable draft. Deterministic: the same text and the same `now`
@@ -812,6 +827,13 @@ export function interpretEntry(transcript: string, now = new Date(), options: In
 		reminder: false
 	};
 
+	const note = personNote(text, options.knownPeople ?? []);
+	const matched = note?.trigger === 'Om …' ? null : matchCommand(text, options.commands ?? []);
+	if (matched) {
+		const draft = commandDraft(text, matched.command, matched.rest, today, todayKey, local);
+		if (draft) return draft;
+	}
+
 	const shopping = REMINDER_PATTERN.test(text) ? null : shoppingItems(text, today);
 	if (shopping) {
 		return {
@@ -828,7 +850,6 @@ export function interpretEntry(transcript: string, now = new Date(), options: In
 		};
 	}
 
-	const note = personNote(text, options.knownPeople ?? []);
 	const calendarLike = /\b(?:middag|frokost|møde|kaffe|dinner|lunch|meeting|coffee|drinks?|fest|party)\b/i.test(text);
 	if (note && (note.trigger === 'Om …' || (!calendarLike && !REMINDER_PATTERN.test(text)))) {
 		// A fact about someone keeps its dates as content ("Annas fødselsdag er 3. maj") and is filed on the day it was said.
@@ -847,6 +868,72 @@ export function interpretEntry(transcript: string, now = new Date(), options: In
 	}
 
 	const classification = classifyEntry(text);
+	return draftFor(text, classification, today, todayKey);
+}
+
+function commandDraft(
+	text: string,
+	command: CommandWord,
+	rest: string,
+	today: Date,
+	todayKey: string,
+	local: Pick<EntryDraft, 'transcript' | 'destinationConfidence' | 'syncStatus' | 'classificationConfidence' | 'calendar' | 'reminder'>
+): EntryDraft | null {
+	const reason = `Command word “${command.word}”`;
+	const name = capitalize(command.word.trim());
+	if (command.category === 'Shopping') {
+		const items = splitShoppingItems(rest);
+		if (!items.length) return null;
+		return {
+			...local,
+			category: 'Shopping',
+			title: items.join(', '),
+			detail: 'Shopping list',
+			when: 'On the list',
+			listItems: items,
+			destination: 'List',
+			destinationReason: 'Goes on the shopping list',
+			status: 'Planned',
+			classificationReason: reason
+		};
+	}
+	if (command.category === 'Note' || command.category === 'Place') {
+		// A note is kept as said, on the day it was said. Dates inside it are content.
+		const body = rest || name;
+		return {
+			...local,
+			category: command.category,
+			title: command.category === 'Place' ? placeTitle(body) : body.length > 60 ? `${body.slice(0, 60).trimEnd()}…` : capitalize(body),
+			detail: command.category === 'Place' ? 'Place to revisit' : 'General timeline entry',
+			when: 'Captured',
+			destination: 'Timeline',
+			destinationReason: 'Kept on the timeline',
+			classificationReason: reason
+		};
+	}
+	const draft = draftFor(rest || name, { category: command.category, confidence: 'High', reason }, today, todayKey);
+	const number = rest.match(COMMAND_NUMBER)?.[1];
+	const value = number === undefined ? undefined : numberFrom(number);
+	const meaning = commandNumberMeaning(command.category);
+	const patched: EntryDraft = { ...draft, transcript: text };
+	if (meaning === 'score') {
+		const score = value !== undefined && value >= 0 && value <= 10 ? value : draft.wellbeingScore;
+		patched.title = name;
+		patched.wellbeingScore = score;
+		patched.detail = score !== undefined ? `${score} / 10` : `${name} noted`;
+	}
+	if (meaning === 'minutes') {
+		const minutes = durationMinutesFrom(rest) ?? (value !== undefined && value > 0 ? Math.round(value) : undefined);
+		const planned = patched.status === 'Planned';
+		patched.title = name;
+		patched.activityMinutes = minutes;
+		patched.detail = minutes ? `${minutes} minutes${planned ? ' planned' : ''}` : planned ? 'Activity planned' : 'Activity logged';
+		if (planned && minutes) patched.durationMinutes = minutes;
+	}
+	return patched;
+}
+
+function draftFor(text: string, classification: Classification, today: Date, todayKey: string): EntryDraft {
 	const schedule = parseSchedule(text, classification.category, today);
 	// A resolved date decides the tense. Verb cues only decide when the entry is dated today or not dated at all.
 	const historical = schedule.date && schedule.date !== todayKey ? schedule.date < todayKey : schedule.tense === 'past';
