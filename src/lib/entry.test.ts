@@ -363,3 +363,10 @@ describe('notes about people', () => {
 		expect(read('Om to uger skal jeg til tandlæge').category).not.toBe('Person');
 	});
 });
+
+describe('social plans', () => {
+	test('carry no status', () => {
+		expect(read('Middag med Anna fredag kl 19').status).toBeUndefined();
+		expect(read('Dinner with Tom yesterday').status).toBeUndefined();
+	});
+});

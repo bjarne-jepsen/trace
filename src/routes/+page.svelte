@@ -11,18 +11,11 @@
 	} from '$lib/entry';
 	import { deleteLocalEntry, listLocalEntries, saveLocalEntries, saveLocalEntry } from '$lib/local-entries';
 	import { dateKeyAfter, describeSchedule, localDateKey, parseDateKey, relativeDayLabel } from '$lib/dates';
-	import {
-		INSIGHT_CATEGORIES,
-		computeInsights,
-		entryCaptureDateKey,
-		entryDateKey,
-		wellbeingScoreOf,
-		type InsightRange
-	} from '$lib/insights';
+	import { TIMELINE_CATEGORIES, entryCaptureDateKey, entryDateKey, wellbeingScoreOf } from '$lib/timeline';
 
 	type CaptureState = 'idle' | 'requesting' | 'listening' | 'processing';
 	type CaptureLanguage = 'da-DK' | 'en-US';
-	type ActiveTab = 'today' | 'timeline' | 'upcoming' | 'insights';
+	type ActiveTab = 'today' | 'timeline' | 'upcoming';
 	type TimelineFilter = EntryCategory | 'All';
 	type NoticeAction = 'undo' | 'capture' | null;
 	type UpcomingGroup = {
@@ -62,7 +55,7 @@
 	};
 
 	const bars = [12, 20, 31, 17, 39, 24, 45, 28, 36, 18, 29, 14];
-	const insightCategories = INSIGHT_CATEGORIES;
+	const timelineCategories = TIMELINE_CATEGORIES;
 	const entryCategories = ENTRY_CATEGORIES;
 	const destinations: EntryDestination[] = ['Timeline', 'Calendar', 'Reminder'];
 	const wellbeingScores = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
@@ -126,7 +119,6 @@
 	let loadingEntries = $state(true);
 	let timeline = $state<TimelineEntry[]>([]);
 	let activeTab = $state<ActiveTab>('today');
-	let insightRange = $state<InsightRange>(7);
 	let timelineQuery = $state('');
 	let timelineFilter = $state<TimelineFilter>('All');
 	let showAllAhead = $state(false);
@@ -189,11 +181,6 @@
 			.filter((entry) => entryTimelineDate(entry) < todayKey && !overdueAttentionEntries.some((attention) => attention.id === entry.id))
 			.sort(compareTimelineDateDescending)
 	);
-	const insights = $derived(computeInsights(traces, insightRange, todayKey));
-	const maxInsightBar = $derived(Math.max(1, ...insights.bars.map((bar) => bar.count)));
-	const insightRangeLabel = $derived(
-		insightRange === 'all' ? (insights.weeksCapped ? 'Last 26 weeks' : 'All time') : `Last ${insightRange} days`
-	);
 	const filteredTimeline = $derived.by(() => {
 		const query = timelineQuery.trim().toLocaleLowerCase();
 		return traces.filter((entry) => {
@@ -212,7 +199,7 @@
 		});
 	});
 	const timelineGroups = $derived(groupTimelineEntries(filteredTimeline, 'desc'));
-	const availableTimelineCategories = $derived(insightCategories.filter((category) => traces.some((entry) => entry.category === category)));
+	const availableTimelineCategories = $derived(timelineCategories.filter((category) => traces.some((entry) => entry.category === category)));
 	// A calendar event whose day has passed has happened; only reminders can be overdue.
 	const actionableEntries = $derived.by(() =>
 		traces
@@ -292,8 +279,10 @@
 			detail = /tinnitus/i.test(entry.transcript) ? 'Tinnitus noted' : 'Wellbeing noted';
 		}
 		if (entry.destination === 'Reminder' && detail === 'Notification on') detail = 'Reminder saved in Trace';
-		if (detail === entry.detail && entry.syncStatus !== 'Ready') return entry;
-		return { ...entry, detail, syncStatus: 'Local' as const };
+		// Social plans no longer carry a status; a stale "Completed" would hide a plan from Plans for good.
+		const dropStatus = entry.category === 'Social' && entry.status !== undefined;
+		if (detail === entry.detail && entry.syncStatus !== 'Ready' && !dropStatus) return entry;
+		return { ...entry, detail, syncStatus: 'Local' as const, status: dropStatus ? undefined : entry.status };
 	}
 
 	// Timeline dates used to come straight from the parser and could not be edited, so a tinnitus score of
@@ -1138,7 +1127,7 @@
 			draftSaveError = `Add a date before routing this to ${draft.destination}.`;
 			return;
 		}
-		if (draft.destination !== 'Timeline' && !draft.status) draft.status = 'Planned';
+		if (draft.destination === 'Reminder' && !draft.status) draft.status = 'Planned';
 		draft.scheduledDate = draft.scheduledDate || undefined;
 		draft.scheduledTime = draft.scheduledTime || undefined;
 		draft.calendar = draft.destination === 'Calendar';
@@ -1263,7 +1252,7 @@
 			scheduledDate: occurrenceDate || '',
 			scheduledTime: interpreted.scheduledTime || '',
 			eventTime: interpreted.scheduledTime || '',
-			status: interpreted.status || (interpreted.destination !== 'Timeline' ? 'Planned' : undefined)
+			status: interpreted.status || (interpreted.destination === 'Reminder' ? 'Planned' : undefined)
 		};
 		editingPeople = interpreted.people?.join(', ') || '';
 		editingScore = String(interpreted.wellbeingScore ?? '');
@@ -1374,9 +1363,6 @@
 		window.scrollTo({ top: 0 });
 	}
 
-	function showInsights() {
-		activeTab = 'insights';
-	}
 
 	function showUpcoming() {
 		activeTab = 'upcoming';
@@ -1443,7 +1429,6 @@
 			<button class:active={activeTab === 'today'} aria-current={activeTab === 'today' ? 'page' : undefined} type="button" onclick={showToday}>Today</button>
 			<button class:active={activeTab === 'upcoming'} aria-current={activeTab === 'upcoming' ? 'page' : undefined} type="button" onclick={showUpcoming}>Plans{#if actionableEntries.length}<span aria-label={`${actionableEntries.length} open`}>{actionableEntries.length}</span>{/if}</button>
 			<button class:active={activeTab === 'timeline'} aria-current={activeTab === 'timeline' ? 'page' : undefined} type="button" onclick={showTimeline}>Archive</button>
-			<button class:active={activeTab === 'insights'} aria-current={activeTab === 'insights' ? 'page' : undefined} type="button" onclick={showInsights}>Insights</button>
 		</nav>
 
 		{#if captureOpen && !draft}
@@ -1604,59 +1589,6 @@
 			</section>
 		{/if}
 
-		{#if activeTab === 'insights'}
-			<section class="insights-screen" aria-labelledby="insights-title">
-				<header class="insights-header">
-					<div><p class="eyebrow">Patterns over time</p><h1 id="insights-title">Insights</h1></div>
-					<span aria-label={`${insights.entries.length} traces in this period`}>{insights.entries.length}</span>
-				</header>
-
-				<div class="range-picker" role="group" aria-label="Insight period">
-					<button class:active={insightRange === 7} aria-pressed={insightRange === 7} type="button" onclick={() => (insightRange = 7)}>7 days</button>
-					<button class:active={insightRange === 30} aria-pressed={insightRange === 30} type="button" onclick={() => (insightRange = 30)}>30 days</button>
-					<button class:active={insightRange === 'all'} aria-pressed={insightRange === 'all'} type="button" onclick={() => (insightRange = 'all')}>All time</button>
-				</div>
-
-				{#if loadingEntries}
-					<div class="insights-empty"><span class="spinner dark"></span><p>Reading your timeline…</p></div>
-				{:else if timeline.length === 0}
-					<div class="insights-empty"><span>⌁</span><h2>Insights start with a trace</h2><p>Capture a few moments and patterns will begin to appear here.</p><button type="button" onclick={() => openCapture()}>Capture something</button></div>
-				{:else if insights.entries.length === 0}
-					<div class="insights-empty"><span>○</span><h2>No traces in this period</h2><p>Choose a longer range to see your earlier captures.</p></div>
-				{:else}
-					<section class="weekly-story-card" aria-label={`Summary, ${insightRangeLabel.toLocaleLowerCase()}`}>
-						<div>{#each insights.stories as story}<p>{story}</p>{/each}</div>
-					</section>
-
-					<section class="signals-section" aria-label="Signals">
-						<div class="signal-grid">
-							<article class="signal-wellbeing"><p>Wellbeing</p><strong>{insights.averageWellbeing === null ? '—' : `${insights.averageWellbeing.toFixed(1)} / 10`}</strong><small>{insights.wellbeingCount} scored {insights.wellbeingCount === 1 ? 'check-in' : 'check-ins'}</small></article>
-							<article class="signal-habit"><p>Activity</p><strong>{insights.activityMinutes ? `${insights.activityMinutes} min` : insights.activityCount}</strong><small>{insights.activityCount} {insights.activityCount === 1 ? 'session' : 'sessions'} done</small></article>
-							<article class="signal-reminder"><p>Reminders</p><strong>{insights.remindersDone} / {insights.reminderCount}</strong><small>done</small></article>
-						</div>
-					</section>
-
-					<section class="activity-card">
-						<div class="insight-heading"><div><p class="eyebrow">Rhythm</p><h2>Traces per {insightRange === 'all' ? 'week' : 'day'}</h2></div><span>{insightRangeLabel}</span></div>
-						<div class="activity-chart" style:--bars={insights.bars.length} role="img" aria-label={`Traces per ${insightRange === 'all' ? 'week' : 'day'}, ${insightRangeLabel.toLocaleLowerCase()}`}>
-							{#each insights.bars as bar (bar.key)}
-								<div class:current={bar.current}><span>{insights.bars.length <= 7 && bar.count ? bar.count : ''}</span><i style:height={`${bar.count ? Math.max(6, (bar.count / maxInsightBar) * 82) : 3}px`}></i><small>{bar.label}</small></div>
-							{/each}
-						</div>
-					</section>
-
-					<section class="category-card">
-						<div class="insight-heading"><div><p class="eyebrow">Composition</p><h2>Your traces</h2></div><span>{insightRangeLabel}</span></div>
-						<div class="category-bars">
-							{#each insights.categoryCounts.filter((item) => item.count > 0) as item}
-								<div><div><span><i class={`category-dot ${item.category.toLowerCase()}`}></i>{item.category}</span><b>{item.count} · {item.percentage}%</b></div><progress value={item.count} max={insights.entries.length}>{item.percentage}%</progress></div>
-							{/each}
-						</div>
-					</section>
-				{/if}
-			</section>
-		{/if}
-
 		{#if !captureOpen && !draft && !editingEntry && !showDataTools}<button class="floating-capture" type="button" onclick={() => openCapture()}><span aria-hidden="true"><i></i></span><b>Capture</b></button>{/if}
 		{#if notice}<div class="toast" role="status"><span>✓</span><b>{notice}</b>{#if noticeAction === 'undo'}<button type="button" onclick={undoDelete}>Undo</button>{:else if noticeAction === 'capture'}<button type="button" onclick={beginAnotherCapture}>Capture another</button>{/if}</div>{/if}
 
@@ -1692,7 +1624,7 @@
 							{#if editInterpretationMessage}<p role="status"><span>✓</span>{editInterpretationMessage}</p>{/if}
 						</section>
 						<div class="entry-edit-grid">
-							<label>Category<select bind:value={editingEntry.category}>{#each insightCategories as category}<option value={category}>{category}</option>{/each}</select></label>
+							<label>Category<select bind:value={editingEntry.category}>{#each timelineCategories as category}<option value={category}>{category}</option>{/each}</select></label>
 							<label>Title<input bind:value={editingEntry.title} required /></label>
 							<label class="wide">Details<input bind:value={editingEntry.detail} required /></label>
 							{#if editingEntry.category === 'Person'}
@@ -1713,8 +1645,8 @@
 							{#if editingEntry.category === 'Social'}
 								<label class="wide">People<input bind:value={editingPeople} placeholder="Michael, Jennifer" /></label>
 							{/if}
-							{#if editingEntry.category === 'Social' || editingEntry.destination !== 'Timeline'}
-								<label class="wide">Status<select bind:value={editingEntry.status}><option value="Planned">Planned</option><option value="Tentative">Tentative</option><option value="Completed">Completed</option></select></label>
+							{#if editingEntry.destination === 'Reminder'}
+								<label class="wide check-field"><input type="checkbox" checked={editingEntry.status === 'Completed'} onchange={(event) => { if (editingEntry) editingEntry.status = event.currentTarget.checked ? 'Completed' : 'Planned'; }} />Done</label>
 							{/if}
 						</div>
 						{#if editingEntry.destination === 'Timeline'}<p class="field-hint">Leave the date empty to keep the day it was captured.</p>{/if}
@@ -1741,7 +1673,7 @@
 					<div class="sheet-heading"><div><span class="success-ring">✓</span><div><p>Here’s what I heard</p><h2 id="confirm-title">{draft.scheduledDates && draft.scheduledDates.length > 1 ? `Confirm ${draft.scheduledDates.length} entries` : 'Confirm your entry'}</h2></div></div><button type="button" onclick={dismissDraft} aria-label="Back to capture">×</button></div>
 					<blockquote>“{draft.transcript}”</blockquote>
 					<div class="interpreted-card">
-						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each entryCategories as category}<option value={category}>{category}</option>{/each}</select>{#if draft.destination !== 'Timeline'}<span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{/if}{#if draft.status}<span class="status-label">{draft.status}</span>{/if}</div>
+						<div class="category-line"><span class={`category-dot ${draft.category.toLowerCase()}`}></span><select bind:value={draft.category} onchange={markDraftCategorySelected} aria-label="Entry category">{#each entryCategories as category}<option value={category}>{category}</option>{/each}</select>{#if draft.destination !== 'Timeline'}<span class={`route-badge ${draft.destination.toLowerCase()}`}>{draft.destination}</span>{/if}</div>
 						{#if showDraftDetails && draft.classificationReason}<p class="classification-reason"><span>⌁</span>{draft.classificationReason} · {draft.classificationConfidence || 'Low'} confidence</p>{/if}
 						{#if draft.destination === 'List'}
 							<div class="draft-list">

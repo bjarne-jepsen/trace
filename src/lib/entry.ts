@@ -897,8 +897,7 @@ export function interpretEntry(transcript: string, now = new Date(), options: In
 			category: 'Social',
 			title: rawTitle ? capitalize(rawTitle) : 'Social event',
 			detail: people.length ? `With ${people.join(' & ')}` : 'Social event',
-			people,
-			status: historical ? 'Completed' : routing.scheduledDate ? 'Planned' : 'Tentative'
+			people
 		};
 	}
 
